@@ -99,6 +99,16 @@ List<math.Point<double>> _pairs(List<double> nums) {
   ];
 }
 
+/// True when LPTS look like viewport-normalized coordinates (~0..1,
+/// Avenza-style) rather than page points (hundreds of points).
+bool _looksNormalized(List<math.Point<double>> lpts) {
+  var m = 0.0;
+  for (final p in lpts) {
+    m = math.max(m, math.max(p.x.abs(), p.y.abs()));
+  }
+  return m < 50;
+}
+
 /// Extracts georeferencing from every page of a parsed PDF.
 ///
 /// Supports:
@@ -152,11 +162,38 @@ class GeorefExtractor {
         final lpts = _pairs(_numbers(_deref(measure['LPTS'])));
         if (gpts.length < 3 || lpts.length < 3) continue;
         final count = math.min(gpts.length, lpts.length);
-        final fit = fitAffine(
-          lpts.take(count).toList(),
-          // GPTS are (lon, lat) pairs.
-          gpts.take(count).toList(),
-        );
+        // GPTS pairs are (latitude, longitude) per the geospatial PDF
+        // encoding; swap to (lon, lat) for the fit.
+        final geo = <math.Point<double>>[
+          for (var i = 0; i < count; i++)
+            math.Point(gpts[i].y, gpts[i].x),
+        ];
+        var fit = fitAffine(lpts.take(count).toList(), geo);
+        // LPTS are often normalized to the viewport /BBox (Avenza-style,
+        // values ~0..1) instead of being given in page points. Fold the
+        // page->LPTS normalization into the affine so the rest of the
+        // pipeline keeps working in page points.
+        final bbox = _deref(v['BBox']);
+        if (bbox is PdfArray && _looksNormalized(lpts)) {
+          final n = bbox.numbers;
+          if (n.length >= 4) {
+            final xlo = math.min(n[0], n[2]);
+            final xhi = math.max(n[0], n[2]);
+            final ylo = math.min(n[1], n[3]);
+            final yhi = math.max(n[1], n[3]);
+            final bw = xhi - xlo, bh = yhi - ylo;
+            if (bw > 0 && bh > 0) {
+              fit = [
+                fit[0] / bw,
+                fit[1] / bh,
+                fit[2] - fit[0] * xlo / bw - fit[1] * ylo / bh,
+                fit[3] / bw,
+                fit[4] / bh,
+                fit[5] - fit[3] * xlo / bw - fit[4] * ylo / bh,
+              ];
+            }
+          }
+        }
         final gcs = _deref(measure['GCS']);
         String? wkt;
         String? desc;

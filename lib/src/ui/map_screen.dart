@@ -102,20 +102,25 @@ class _MapScreenState extends State<MapScreen> {
       _status = 'Rendering maps…';
     });
     var failures = 0;
+    String? firstError;
     for (final map in _scope.library.maps) {
       if (!map.visible) continue;
       for (final page in map.pages) {
         try {
           await _addOverlay(c, map, page);
-        } catch (_) {
+        } catch (e) {
           failures++;
+          firstError ??= e.toString().replaceFirst('StateError: ', '');
         }
       }
     }
     if (mounted) {
       setState(() {
         _busy = false;
-        _status = failures > 0 ? '$failures page(s) failed to render' : null;
+        _status = failures > 0
+            ? '$failures page(s) failed to render'
+                '${firstError != null ? ': $firstError' : ''}'
+            : null;
       });
     }
   }
@@ -134,6 +139,7 @@ class _MapScreenState extends State<MapScreen> {
       bottomRight: LatLng(overlay.corners[2].y, overlay.corners[2].x),
       bottomLeft: LatLng(overlay.corners[3].y, overlay.corners[3].x),
     );
+    _validateQuad(overlay.corners, page);
     final sid = _sourceId(map, page);
     final lid = _layerId(map, page);
     await c.addImageSource(sid, overlay.pngBytes, quad);
@@ -144,6 +150,47 @@ class _MapScreenState extends State<MapScreen> {
     );
     _sourceIds.add(sid);
     _layerIds.add(lid);
+  }
+
+  /// Guards the native map against out-of-range coordinates.
+  ///
+  /// When a PDF's coordinate system can't be resolved (e.g. a projected
+  /// CRS without usable WKT), the raw projected values would otherwise be
+  /// fed to MapLibre as lon/lat (latitude 9,234,500, …) and kill the app
+  /// natively. Fail loudly in Dart instead, with a diagnosable message.
+  void _validateQuad(List<math.Point<double>> corners, GeoMapPage page) {
+    var minLon = double.infinity, maxLon = -double.infinity;
+    var minLat = double.infinity, maxLat = -double.infinity;
+    for (final p in corners) {
+      final lon = p.x, lat = p.y;
+      if (!lon.isFinite || !lat.isFinite) {
+        throw StateError(
+          'Page "${page.name}" has non-finite coordinates. '
+          'Coordinate system: ${page.georef.crsDescription ?? 'unknown'}.',
+        );
+      }
+      minLon = math.min(minLon, lon);
+      maxLon = math.max(maxLon, lon);
+      minLat = math.min(minLat, lat);
+      maxLat = math.max(maxLat, lat);
+    }
+    final crs = page.georef.crsDescription ?? 'unknown';
+    if (minLon < -180 ||
+        maxLon > 180 ||
+        minLat < -90 ||
+        maxLat > 90) {
+      throw StateError(
+        'Page "${page.name}" coordinates are outside the valid world range '
+        '(lon ${minLon.toStringAsFixed(1)}…${maxLon.toStringAsFixed(1)}, '
+        'lat ${minLat.toStringAsFixed(1)}…${maxLat.toStringAsFixed(1)}). '
+        'Its coordinate system ($crs) is not supported yet.',
+      );
+    }
+    if (maxLon - minLon < 1e-9 || maxLat - minLat < 1e-9) {
+      throw StateError(
+        'Page "${page.name}" has a degenerate (zero-area) map extent.',
+      );
+    }
   }
 
   Future<void> _zoomToMap(GeoMap map) async {

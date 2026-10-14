@@ -144,7 +144,9 @@ void main() {
 
   group('GeorefExtractor', () {
     test('extracts OGC /VP /Measure georeferencing', () {
-      // LPTS (0,0)->(106.8,-6.2), (612,0)->(106.9,-6.2), (612,792)->(106.9,-6.3)
+      // GPTS pairs are (lat, lon): (0,0)->(106.8,-6.2),
+      // (612,0)->(106.9,-6.2), (612,792)->(106.9,-6.3).
+      // LPTS here are already in page points, so no BBox folding.
       final pdf = buildPdf([
         '<< /Type /Catalog /Pages 2 0 R >>',
         '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
@@ -152,7 +154,7 @@ void main() {
             '/VP [4 0 R] >>',
         '<< /Type /Viewport /BBox [0 0 612 792] /Measure 5 0 R >>',
         '<< /Subtype /GEO '
-            '/GPTS [106.8 -6.2 106.9 -6.2 106.9 -6.3] '
+            '/GPTS [-6.2 106.8 -6.2 106.9 -6.3 106.9] '
             '/LPTS [0 0 612 0 612 792] '
             '/GCS << /WKT (GEOGCS["WGS 84"]) >> >>',
       ]);
@@ -166,6 +168,36 @@ void main() {
       final lon = g.a * 0 + g.b * 792 + g.c;
       final lat = g.d * 0 + g.e * 792 + g.f;
       expect(lon, closeTo(106.8, 1e-9));
+      expect(lat, closeTo(-6.3, 1e-9));
+    });
+
+    test('OGC with viewport-normalized LPTS folds BBox into the affine', () {
+      // Avenza-style: LPTS ~0..1 normalized to /BBox; GPTS are (lat, lon).
+      // (0,0)->(106.8,-6.3), (1,0)->(106.9,-6.3), (1,1)->(106.9,-6.2).
+      final pdf = buildPdf([
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] '
+            '/VP [4 0 R] >>',
+        '<< /Type /Viewport /BBox [0 0 200 100] /Measure 5 0 R >>',
+        '<< /Subtype /GEO '
+            '/GPTS [-6.3 106.8 -6.3 106.9 -6.2 106.9] '
+            '/LPTS [0 0 1 0 1 1] '
+            '/GCS << /WKT (GEOGCS["WGS 84"]) >> >>',
+      ]);
+      final parser = PdfParser.parse(pdf);
+      final georefs = GeorefExtractor(parser).extractAll();
+      expect(georefs.length, 1);
+      final g = georefs.single;
+      // Page corners must map through the folded affine:
+      // (0,100) -> (106.8,-6.2), (200,0) -> (106.9,-6.3).
+      var lon = g.a * 0 + g.b * 100 + g.c;
+      var lat = g.d * 0 + g.e * 100 + g.f;
+      expect(lon, closeTo(106.8, 1e-9));
+      expect(lat, closeTo(-6.2, 1e-9));
+      lon = g.a * 200 + g.b * 0 + g.c;
+      lat = g.d * 200 + g.e * 0 + g.f;
+      expect(lon, closeTo(106.9, 1e-9));
       expect(lat, closeTo(-6.3, 1e-9));
     });
 
