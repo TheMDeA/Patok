@@ -1,0 +1,158 @@
+name: Build APK
+
+on:
+  push:
+    tags: ['v*']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "Build mode"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: stable
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "No release keystore secret configured; signing with debug keys."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+          } >> "$GITHUB_ENV"
+          echo "Release keystore decoded."
+
+      - name: Build APK
+        run: |
+          MODE="${{ github.event.inputs.build_mode || 'release' }}"
+          flutter build apk --$MODE --target-platform android-arm64 > "$RUNNER_TEMP/flutter-build.log" 2>&1
+          code=$?
+          cat "$RUNNER_TEMP/flutter-build.log"
+          exit $code
+
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/flutter-build.log"
+          if [ -f "$log" ]; then
+            errors=$(grep -E "error:|Error|FAILED|Exception|FAILURE|What went wrong" "$log" | head -60 || true)
+            echo "=== ERRORS ==="
+            echo "$errors" | while IFS= read -r line; do echo "##[error]$line"; done
+            {
+              echo "### Flutter Build Errors"
+              echo '```'
+              echo "$errors"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "##[error]Build log not found at $log"
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-log
+          path: ${{ runner.temp }}/flutter-build.log
+          if-no-files-found: ignore
+
+      - name: Locate APK
+        id: apk
+        if: success()
+        shell: bash
+        run: |
+          MODE="${{ github.event.inputs.build_mode || 'release' }}"
+          apk="build/app/outputs/flutter-apk/app-$MODE.apk"
+          if [ ! -f "$apk" ]; then
+            echo "##[error]No APK at $apk"
+            exit 1
+          fi
+          echo "Found APK: $apk ($(( $(stat -c%s "$apk") / 1024 / 1024 )) MB)"
+          echo "apk_path=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patok-apk
+          path: ${{ steps.apk.outputs.apk_path }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify pubspec version matches tag
+        shell: bash
+        run: |
+          version=$(grep -oP '^version:\s*\K[0-9]+\.[0-9]+\.[0-9]+' pubspec.yaml)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "pubspec version=$version tag=$tag"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read version from pubspec.yaml"
+            exit 1
+          fi
+          if [ "$version" != "$tag" ]; then
+            echo "::error::pubspec version ($version) does not match release tag ($tag). Bump the version and commit before tagging."
+            exit 1
+          fi
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: patok-apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Patok ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body_path: release.md
+          files: |
+            **/*.apk
