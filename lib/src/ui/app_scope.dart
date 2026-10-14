@@ -1,0 +1,33 @@
+import 'package:flutter/widgets.dart';
+
+import '../services.dart';
+
+/// Simple service locator for the app's singletons.
+class AppScope extends InheritedWidget {
+  const AppScope({
+    super.key,
+    required this.library,
+    required this.renderService,
+    required this.importService,
+    required this.locationService,
+    required this.settings,
+    required this.fieldData,
+    required super.child,
+  });
+
+  final MapLibrary library;
+  final RenderService renderService;
+  final ImportService importService;
+  final LocationService locationService;
+  final SettingsService settings;
+  final FieldDataStore fieldData;
+
+  static AppScope of(BuildContext context) {
+    final scope = context.dependOnInheritedWidgetOfExactType<AppScope>();
+    assert(scope != null, 'AppScope not found in widget tree');
+    return scope!;
+  }
+
+  @override
+  bool updateShouldNotify(AppScope oldWidget) => false;
+}

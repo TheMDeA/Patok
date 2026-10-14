@@ -1,0 +1,1 @@
+{"layers":[{"id":"background","paint":{"background-color":"#101418"},"type":"background"}],"metadata":{"maplibre:author":"Patok","maplibre:description":"Minimal offline base style. Map overlays are added as image sources at runtime."},"name":"Patok Dark (offline)","sources":{},"version":8}
