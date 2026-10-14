@@ -2,9 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
@@ -17,6 +17,27 @@ import 'geopdf/pdf_parser.dart';
 import 'models.dart';
 
 const _uuid = Uuid();
+
+/// Arguments for [_encodePngIsolate]; must be a simple transferable type.
+class _PngEncodeArgs {
+  _PngEncodeArgs(this.width, this.height, this.bgra);
+  final int width;
+  final int height;
+  final Uint8List bgra;
+}
+
+/// Encodes BGRA8888 pixels as PNG. Runs on a background isolate via
+/// [compute] so large pages don't freeze or OOM the UI thread.
+Uint8List _encodePngIsolate(_PngEncodeArgs args) {
+  final decoded = img.Image.fromBytes(
+    width: args.width,
+    height: args.height,
+    bytes: args.bgra.buffer,
+    numChannels: 4,
+    order: img.ChannelOrder.bgra,
+  );
+  return Uint8List.fromList(img.encodePng(decoded));
+}
 
 Future<Directory> _appDir() async {
   final docs = await getApplicationDocumentsDirectory();
@@ -90,8 +111,8 @@ class RenderService {
   /// Renders [pageIndex] of the PDF at [pdfPath] at [dpi], returning the
   /// PNG bytes plus the WGS84 corner coordinates for a map image source.
   ///
-  /// Large pages are capped so the bitmap stays under ~4096px on its long
-  /// edge (GL texture limit); v2 will tile instead.
+  /// Large pages are capped so the bitmap stays under ~2048px on its long
+  /// edge (memory safety on real devices); v2 will tile instead.
   Future<PageOverlay> renderPage({
     required String pdfPath,
     required PageGeoref georef,
@@ -109,7 +130,10 @@ class RenderService {
         wPx = hPx;
         hPx = t;
       }
-      const maxEdge = 4096;
+      const maxEdge = 2048;
+      // Cap well below the GL texture limit: a 2048px RGBA image is ~17MB,
+      // while 4096px (67MB) plus PNG-encode working buffers reliably
+      // OOM-kills the app on real devices. Tiling (v2) removes the cap.
       final longEdge = math.max(wPx, hPx);
       if (longEdge > maxEdge) {
         final scale = maxEdge / longEdge;
@@ -125,15 +149,12 @@ class RenderService {
         throw StateError('Failed to render page ${georef.pageIndex}');
       }
       try {
-        // pdfrx gives BGRA8888; encode as PNG for the map SDK.
-        final decoded = img.Image.fromBytes(
-          width: image.width,
-          height: image.height,
-          bytes: image.pixels.buffer,
-          numChannels: 4,
-          order: img.ChannelOrder.bgra,
+        // BGRA -> PNG on a background isolate: the pure-Dart encoder
+        // blocks the UI thread for seconds on large images (ANR).
+        final png = await compute(
+          _encodePngIsolate,
+          _PngEncodeArgs(image.width, image.height, image.pixels),
         );
-        final png = Uint8List.fromList(img.encodePng(decoded));
         final corners = _corners(
           georef: georef,
           imgW: image.width.toDouble(),
