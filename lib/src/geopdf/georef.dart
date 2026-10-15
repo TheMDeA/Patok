@@ -183,13 +183,16 @@ class GeorefExtractor {
             final yhi = math.max(n[1], n[3]);
             final bw = xhi - xlo, bh = yhi - ylo;
             if (bw > 0 && bh > 0) {
+              // LPTS y runs DOWN from the top of the viewport (yhi), not up
+              // from the bottom: verified against the north arrow and the
+              // control points of a real Avenza file (north = page-up).
               fit = [
                 fit[0] / bw,
-                fit[1] / bh,
-                fit[2] - fit[0] * xlo / bw - fit[1] * ylo / bh,
+                -fit[1] / bh,
+                fit[2] - fit[0] * xlo / bw + fit[1] * yhi / bh,
                 fit[3] / bw,
-                fit[4] / bh,
-                fit[5] - fit[3] * xlo / bw - fit[4] * ylo / bh,
+                -fit[4] / bh,
+                fit[5] - fit[3] * xlo / bw + fit[4] * yhi / bh,
               ];
             }
           }

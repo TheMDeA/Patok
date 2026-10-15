@@ -174,6 +174,7 @@ void main() {
     test('OGC with viewport-normalized LPTS folds BBox into the affine', () {
       // Avenza-style: LPTS ~0..1 normalized to /BBox; GPTS are (lat, lon).
       // (0,0)->(106.8,-6.3), (1,0)->(106.9,-6.3), (1,1)->(106.9,-6.2).
+      // LPTS y runs DOWN from the top of the viewport.
       final pdf = buildPdf([
         '<< /Type /Catalog /Pages 2 0 R >>',
         '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
@@ -190,15 +191,20 @@ void main() {
       expect(georefs.length, 1);
       final g = georefs.single;
       // Page corners must map through the folded affine:
-      // (0,100) -> (106.8,-6.2), (200,0) -> (106.9,-6.3).
+      // top-left (0,100) -> (106.8,-6.3), bottom-right (200,0) -> (106.9,-6.2),
+      // bottom-left (0,0) -> (106.8,-6.2).
       var lon = g.a * 0 + g.b * 100 + g.c;
       var lat = g.d * 0 + g.e * 100 + g.f;
       expect(lon, closeTo(106.8, 1e-9));
-      expect(lat, closeTo(-6.2, 1e-9));
+      expect(lat, closeTo(-6.3, 1e-9));
       lon = g.a * 200 + g.b * 0 + g.c;
       lat = g.d * 200 + g.e * 0 + g.f;
       expect(lon, closeTo(106.9, 1e-9));
-      expect(lat, closeTo(-6.3, 1e-9));
+      expect(lat, closeTo(-6.2, 1e-9));
+      lon = g.a * 0 + g.b * 0 + g.c;
+      lat = g.d * 0 + g.e * 0 + g.f;
+      expect(lon, closeTo(106.8, 1e-9));
+      expect(lat, closeTo(-6.2, 1e-9));
     });
 
     test('extracts TerraGo /LGIDict /Registration with UTM WKT', () {
