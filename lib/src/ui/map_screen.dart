@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
+import 'package:proj4dart/proj4dart.dart' as proj4;
 
 import 'app_scope.dart';
 import '../models.dart';
@@ -78,6 +79,7 @@ class _MapScreenState extends State<MapScreen> {
 
   Future<void> _onStyleLoaded() async {
     await _refreshOverlays();
+    await _redrawAnnotations();
   }
 
   Future<void> _refreshOverlays() async {
@@ -219,6 +221,50 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  /// Applies a map's visibility/opacity without re-rendering its PDF
+  /// pages: the image source is kept, only the raster layer is re-added.
+  Future<void> _applyLayerState(GeoMap map) async {
+    final c = _controller;
+    if (c == null) return;
+    for (final page in map.pages) {
+      final sid = _sourceId(map, page);
+      final lid = _layerId(map, page);
+      final hasLayer = _layerIds.contains(lid);
+      if (map.visible && !hasLayer) {
+        if (!_sourceIds.contains(sid)) {
+          // Source is gone (e.g. style reloaded mid-sheet); fall back
+          // to a full refresh.
+          await _refreshOverlays();
+          return;
+        }
+        await c.addRasterLayer(
+          sid,
+          lid,
+          RasterLayerProperties(rasterOpacity: map.opacity),
+        );
+        _layerIds.add(lid);
+      } else if (!map.visible && hasLayer) {
+        try {
+          await c.removeLayer(lid);
+        } catch (_) {}
+        _layerIds.remove(lid);
+      } else if (map.visible && hasLayer) {
+        // Opacity changed: re-add the layer with the new opacity.
+        // The image source is untouched, so no re-render happens.
+        try {
+          await c.removeLayer(lid);
+        } catch (_) {}
+        _layerIds.remove(lid);
+        await c.addRasterLayer(
+          sid,
+          lid,
+          RasterLayerProperties(rasterOpacity: map.opacity),
+        );
+        _layerIds.add(lid);
+      }
+    }
+  }
+
   // -------------------------------------------------------------- layers
 
   void _showLayersSheet() {
@@ -227,16 +273,188 @@ class _MapScreenState extends State<MapScreen> {
       isScrollControlled: true,
       builder: (ctx) => _LayersSheet(
         maps: _scope.library.maps,
-        onChanged: () async {
+        showGrid: _scope.settings.showUtmGrid,
+        onStateChanged: (m) async {
           await _scope.library.save();
           if (mounted) setState(() {});
-          await _refreshOverlays();
+          await _applyLayerState(m);
+        },
+        onGridChanged: (v) async {
+          await _scope.settings.setShowUtmGrid(v);
+          if (mounted) setState(() {});
+          await _redrawAnnotations();
         },
         onZoom: (m) {
           Navigator.pop(ctx);
           _zoomToMap(m);
         },
       ),
+    );
+  }
+
+  // ---------------------------------------------------------- annotations
+  // Single clear + redraw for everything drawn above the map: UTM grid
+  // (if enabled) -> saved measurements -> waypoints -> the active
+  // measure line. Unified so measure mode never wipes field data and
+  // z-order stays correct.
+
+  Future<void> _redrawAnnotations() async {
+    final c = _controller;
+    if (c == null) return;
+    try {
+      await c.clearLines();
+    } catch (_) {}
+    try {
+      await c.clearCircles();
+    } catch (_) {}
+
+    if (_scope.settings.showUtmGrid) {
+      await _drawUtmGrid(c);
+    }
+
+    try {
+      final ms = await _scope.fieldData.measurements();
+      if (ms.isNotEmpty) {
+        await c.addLines(
+          ms
+              .map((m) => LineOptions(
+                    geometry:
+                        m.points.map((p) => LatLng(p[1], p[0])).toList(),
+                    lineColor: '#4CAF50',
+                    lineWidth: 3.0,
+                  ))
+              .toList(),
+        );
+      }
+    } catch (_) {}
+
+    try {
+      final wps = await _scope.fieldData.waypoints();
+      if (wps.isNotEmpty) {
+        await c.addCircles(
+          wps
+              .map((w) => CircleOptions(
+                    geometry: LatLng(w.latitude, w.longitude),
+                    circleRadius: 8.0,
+                    circleColor: '#2196F3',
+                    circleStrokeWidth: 2.0,
+                    circleStrokeColor: '#FFFFFF',
+                  ))
+              .toList(),
+        );
+      }
+    } catch (_) {}
+
+    if (_measureMode && _measurePoints.isNotEmpty) {
+      await c.addLine(
+        LineOptions(
+          geometry: List.of(_measurePoints),
+          lineColor: '#FF6B1A',
+          lineWidth: 4.0,
+        ),
+      );
+      await c.addCircles(
+        _measurePoints
+            .map((p) => CircleOptions(
+                  geometry: p,
+                  circleRadius: 7.0,
+                  circleColor: '#FF6B1A',
+                  circleStrokeWidth: 2.0,
+                  circleStrokeColor: '#000000',
+                ))
+            .toList(),
+      );
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Draws a UTM grid over the visible region. Line spacing follows zoom.
+  Future<void> _drawUtmGrid(MapLibreMapController c) async {
+    try {
+      final pos = c.cameraPosition;
+      if (pos == null) return;
+      final region = await c.getVisibleRegion();
+      final zoom = pos.zoom;
+      final interval = zoom >= 15
+          ? 500.0
+          : zoom >= 13
+              ? 1000.0
+              : zoom >= 11
+                  ? 2000.0
+                  : zoom >= 9
+                      ? 5000.0
+                      : 10000.0;
+      final centerLon =
+          (region.northeast.longitude + region.southwest.longitude) / 2;
+      final centerLat =
+          (region.northeast.latitude + region.southwest.latitude) / 2;
+      final zone = ((centerLon + 180) / 6).floor() + 1;
+      final utm = proj4.Projection.parse(
+        '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
+        '${centerLat < 0 ? ' +south' : ''}',
+      );
+      math.Point<double> toUtm(double lon, double lat) {
+        final p = proj4.Projection.WGS84.transform(
+            utm, proj4.Point(x: lon, y: lat));
+        return math.Point(p.x, p.y);
+      }
+
+      final sw = toUtm(
+          region.southwest.longitude, region.southwest.latitude);
+      final ne = toUtm(
+          region.northeast.longitude, region.northeast.latitude);
+      final minE = math.min(sw.x, ne.x), maxE = math.max(sw.x, ne.x);
+      final minN = math.min(sw.y, ne.y), maxN = math.max(sw.y, ne.y);
+
+      const maxLines = 40;
+      final lines = <LineOptions>[];
+      var e = (minE / interval).floor() * interval;
+      var count = 0;
+      while (e <= maxE && count < maxLines) {
+        lines.add(_utmGridLine(utm, easting: e, minN: minN, maxN: maxN));
+        e += interval;
+        count++;
+      }
+      var n = (minN / interval).floor() * interval;
+      count = 0;
+      while (n <= maxN && count < maxLines) {
+        lines.add(_utmGridLine(utm, northing: n, minE: minE, maxE: maxE));
+        n += interval;
+        count++;
+      }
+      if (lines.isNotEmpty) await c.addLines(lines);
+    } catch (_) {}
+  }
+
+  LineOptions _utmGridLine(
+    proj4.Projection utm, {
+    double? easting,
+    double? northing,
+    double? minE,
+    double? maxE,
+    double? minN,
+    double? maxN,
+  }) {
+    const samples = 24;
+    final pts = <LatLng>[];
+    for (var i = 0; i <= samples; i++) {
+      double x, y;
+      if (easting != null) {
+        x = easting;
+        y = minN! + (maxN! - minN) * i / samples;
+      } else {
+        x = minE! + (maxE! - minE) * i / samples;
+        y = northing!;
+      }
+      final p =
+          utm.transform(proj4.Projection.WGS84, proj4.Point(x: x, y: y));
+      pts.add(LatLng(p.y, p.x));
+    }
+    return LineOptions(
+      geometry: pts,
+      lineColor: '#9AA7B2',
+      lineWidth: 1.0,
+      lineOpacity: 0.45,
     );
   }
 
@@ -247,41 +465,13 @@ class _MapScreenState extends State<MapScreen> {
       _measureMode = !_measureMode;
       _measurePoints.clear();
     });
-    _controller?.clearLines();
-    _controller?.clearCircles();
+    _redrawAnnotations();
   }
 
   Future<void> _onMapClick(math.Point<double> point, LatLng latLng) async {
     if (!_measureMode) return;
     setState(() => _measurePoints.add(latLng));
-    await _redrawMeasure();
-  }
-
-  Future<void> _redrawMeasure() async {
-    final c = _controller;
-    if (c == null) return;
-    await c.clearLines();
-    await c.clearCircles();
-    if (_measurePoints.isEmpty) return;
-    await c.addLine(
-      LineOptions(
-        geometry: List.of(_measurePoints),
-        lineColor: '#FF6B1A',
-        lineWidth: 4.0,
-      ),
-    );
-    await c.addCircles(
-      _measurePoints
-          .map((p) => CircleOptions(
-                geometry: p,
-                circleRadius: 7.0,
-                circleColor: '#FF6B1A',
-                circleStrokeWidth: 2.0,
-                circleStrokeColor: '#000000',
-              ))
-          .toList(),
-    );
-    setState(() {});
+    await _redrawAnnotations();
   }
 
   double get _measureLength {
@@ -365,7 +555,10 @@ class _MapScreenState extends State<MapScreen> {
               onMapCreated: (c) => _controller = c,
               onStyleLoadedCallback: _onStyleLoaded,
               onMapClick: _onMapClick,
-              onCameraIdle: _updateCoordReadout,
+              onCameraIdle: () {
+                _updateCoordReadout();
+                _redrawAnnotations();
+              },
             )
           else
             const Center(child: CircularProgressIndicator()),
@@ -409,15 +602,21 @@ class _MapScreenState extends State<MapScreen> {
                                 builder: (_) => const LibraryScreen()),
                           );
                           await _refreshOverlays();
+                          await _redrawAnnotations();
                           if (mounted) setState(() {});
                           break;
                         case 'import':
-                          await Navigator.push(
+                          final imported =
+                              await Navigator.push<GeoMap>(
                             context,
                             MaterialPageRoute(
                                 builder: (_) => const ImportScreen()),
                           );
                           await _refreshOverlays();
+                          if (imported != null) {
+                            await _zoomToMap(imported);
+                          }
+                          await _redrawAnnotations();
                           if (mounted) setState(() {});
                           break;
                         case 'tools':
@@ -426,14 +625,24 @@ class _MapScreenState extends State<MapScreen> {
                             MaterialPageRoute(
                                 builder: (_) => const ToolsScreen()),
                           );
+                          // Waypoints / measurements may have changed.
+                          await _redrawAnnotations();
                           break;
                         case 'settings':
+                          final dpiBefore =
+                              _scope.settings.renderDpi;
                           await Navigator.push(
                             context,
                             MaterialPageRoute(
-                                builder: (_) => const SettingsScreen()),
+                                builder: (_) =>
+                                    const SettingsScreen()),
                           );
                           if (mounted) setState(() {});
+                          _updateCoordReadout();
+                          if (_scope.settings.renderDpi != dpiBefore) {
+                            await _refreshOverlays();
+                          }
+                          await _redrawAnnotations();
                           break;
                       }
                     },
@@ -489,7 +698,7 @@ class _MapScreenState extends State<MapScreen> {
                         onUndo: () async {
                           if (_measurePoints.isNotEmpty) {
                             setState(() => _measurePoints.removeLast());
-                            await _redrawMeasure();
+                            await _redrawAnnotations();
                           }
                         },
                         onSave: _saveMeasurement,
@@ -659,11 +868,15 @@ class _MeasurePanel extends StatelessWidget {
 class _LayersSheet extends StatefulWidget {
   const _LayersSheet({
     required this.maps,
-    required this.onChanged,
+    required this.showGrid,
+    required this.onStateChanged,
+    required this.onGridChanged,
     required this.onZoom,
   });
   final List<GeoMap> maps;
-  final Future<void> Function() onChanged;
+  final bool showGrid;
+  final Future<void> Function(GeoMap) onStateChanged;
+  final Future<void> Function(bool) onGridChanged;
   final void Function(GeoMap) onZoom;
 
   @override
@@ -671,6 +884,14 @@ class _LayersSheet extends StatefulWidget {
 }
 
 class _LayersSheetState extends State<_LayersSheet> {
+  late bool _showGrid;
+
+  @override
+  void initState() {
+    super.initState();
+    _showGrid = widget.showGrid;
+  }
+
   @override
   Widget build(BuildContext context) {
     return SafeArea(
@@ -681,6 +902,18 @@ class _LayersSheetState extends State<_LayersSheet> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Layers', style: Theme.of(context).textTheme.headlineSmall),
+            const SizedBox(height: 8),
+            Card(
+              child: SwitchListTile(
+                title: const Text('UTM grid'),
+                subtitle: const Text('Coordinate grid over the map'),
+                value: _showGrid,
+                onChanged: (v) async {
+                  setState(() => _showGrid = v);
+                  await widget.onGridChanged(v);
+                },
+              ),
+            ),
             const SizedBox(height: 8),
             if (widget.maps.isEmpty)
               Padding(
@@ -735,7 +968,7 @@ class _LayersSheetState extends State<_LayersSheet> {
                                   value: m.visible,
                                   onChanged: (v) async {
                                     setState(() => m.visible = v);
-                                    await widget.onChanged();
+                                    await widget.onStateChanged(m);
                                   },
                                 ),
                               ],
@@ -750,7 +983,8 @@ class _LayersSheetState extends State<_LayersSheet> {
                                     value: m.opacity,
                                     onChanged: (v) =>
                                         setState(() => m.opacity = v),
-                                    onChangeEnd: (_) => widget.onChanged(),
+                                    onChangeEnd: (_) =>
+                                        widget.onStateChanged(m),
                                   ),
                                 ),
                                 SizedBox(

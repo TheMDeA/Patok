@@ -5,6 +5,17 @@ and concise.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-15
+
+### Fixed
+- Imported maps now land in the right place and orientation
+  (georeferencing corrections for Avenza-style PDFs)
+- Map camera zooms to a map right after import
+- Waypoints and saved measurements now appear on the map
+- UTM grid setting now works (toggle in the Layers sheet)
+- Sunlight mode applies immediately, no restart needed
+- Toggling layer visibility/opacity no longer re-renders the map
+
 ## [1.0.0] - 2026-10-14
 
 First public release.

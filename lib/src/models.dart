@@ -3,7 +3,7 @@ import 'dart:convert';
 /// How a page's georeferencing was encoded in the PDF.
 enum GeorefKind {
   /// OGC/Adobe style: page /VP viewport + /Measure /Subtype /GEO
-  /// (GPTS are already lon/lat).
+  /// (GPTS pairs are (latitude, longitude); swapped to lon/lat on read).
   ogc,
 
   /// TerraGo style: /LGIDict with /Registration or /CTM

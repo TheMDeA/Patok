@@ -31,14 +31,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onChanged: (v) async {
                     await settings.setSunlightMode(v);
                     if (mounted) setState(() {});
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text(
-                              'Restart the app to apply the theme change'),
-                        ),
-                      );
-                    }
                   },
                 ),
                 const Divider(height: 1),
@@ -113,7 +105,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Patok 0.1.0',
+                  Text('Patok 1.0.1',
                       style: TextStyle(fontWeight: FontWeight.w600)),
                   SizedBox(height: 8),
                   Text(

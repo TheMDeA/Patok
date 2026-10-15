@@ -26,7 +26,16 @@ class _ToolsScreenState extends State<ToolsScreen>
   void initState() {
     super.initState();
     _tabs = TabController(length: 2, vsync: this);
+    _tabs.addListener(() {
+      if (mounted) setState(() {});
+    });
     _reload();
+  }
+
+  @override
+  void dispose() {
+    _tabs.dispose();
+    super.dispose();
   }
 
   Future<void> _reload() async {
@@ -129,11 +138,13 @@ class _ToolsScreenState extends State<ToolsScreen>
                 ),
               ],
             ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _addWaypointAtGps,
-        icon: const Icon(Icons.add_location_alt),
-        label: const Text('Waypoint at GPS'),
-      ),
+      floatingActionButton: _tabs.index == 0
+          ? FloatingActionButton.extended(
+              onPressed: _addWaypointAtGps,
+              icon: const Icon(Icons.add_location_alt),
+              label: const Text('Waypoint at GPS'),
+            )
+          : null,
     );
   }
 }

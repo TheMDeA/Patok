@@ -42,13 +42,14 @@ class PatokApp extends StatefulWidget {
 class _PatokAppState extends State<PatokApp> {
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Patok',
-      debugShowCheckedModeBanner: false,
-      theme: PatokTheme.dark(
-        sunlightMode: widget.settings.sunlightMode,
+    return ValueListenableBuilder<bool>(
+      valueListenable: widget.settings.sunlightModeListenable,
+      builder: (context, sunlight, _) => MaterialApp(
+        title: 'Patok',
+        debugShowCheckedModeBanner: false,
+        theme: PatokTheme.dark(sunlightMode: sunlight),
+        home: const MapScreen(),
       ),
-      home: const MapScreen(),
     );
   }
 }

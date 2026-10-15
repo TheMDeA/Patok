@@ -325,15 +325,23 @@ class LocationService {
 
 /// App settings backed by SharedPreferences.
 class SettingsService {
-  SettingsService._(this._prefs);
+  SettingsService._(this._prefs) {
+    _sunlightMode.value = _prefs.getBool('sunlightMode') ?? false;
+  }
   final SharedPreferences _prefs;
+
+  /// Notified whenever sunlight mode changes so the theme applies live.
+  final ValueNotifier<bool> _sunlightMode = ValueNotifier(false);
+  ValueListenable<bool> get sunlightModeListenable => _sunlightMode;
 
   static Future<SettingsService> load() async =>
       SettingsService._(await SharedPreferences.getInstance());
 
-  bool get sunlightMode => _prefs.getBool('sunlightMode') ?? false;
-  Future<void> setSunlightMode(bool v) =>
-      _prefs.setBool('sunlightMode', v);
+  bool get sunlightMode => _sunlightMode.value;
+  Future<void> setSunlightMode(bool v) async {
+    await _prefs.setBool('sunlightMode', v);
+    _sunlightMode.value = v;
+  }
 
   /// Render DPI for map overlays (96 / 150 / 300).
   double get renderDpi => _prefs.getDouble('renderDpi') ?? 150;
