@@ -9,24 +9,27 @@ import 'package:proj4dart/proj4dart.dart' as proj4;
 
 import 'app_scope.dart';
 import '../models.dart';
+import '../services.dart';
 import '../geopdf/georef.dart';
 import '../theme.dart';
-import 'import_screen.dart';
-import 'library_screen.dart';
-import 'settings_screen.dart';
-import 'tools_screen.dart';
 
 /// Map workspace: full-bleed MapLibre map with imported georeferenced
 /// PDF pages as image overlays, GPS, layers sheet, measure mode and a
 /// coordinate readout bar.
+///
+/// Lives inside [HomeScreen]'s tab stack; cross-tab actions (open map,
+/// start measure, go to GPS) go through the public methods below.
 class MapScreen extends StatefulWidget {
-  const MapScreen({super.key});
+  const MapScreen({super.key, this.onBrowseMaps});
+
+  /// Called when the user taps the empty-state button (no maps yet).
+  final VoidCallback? onBrowseMaps;
 
   @override
-  State<MapScreen> createState() => _MapScreenState();
+  State<MapScreen> createState() => MapScreenState();
 }
 
-class _MapScreenState extends State<MapScreen> {
+class MapScreenState extends State<MapScreen> {
   MapLibreMapController? _controller;
   String? _styleJson;
   bool _busy = false;
@@ -34,6 +37,11 @@ class _MapScreenState extends State<MapScreen> {
 
   final Set<String> _sourceIds = {};
   final Set<String> _layerIds = {};
+
+  // Dirty-checking for tab switches: re-render only when the library
+  // or the render DPI changed while the Map tab was hidden.
+  int _lastFingerprint = 0;
+  double _lastDpi = -1;
 
   // Measure mode.
   bool _measureMode = false;
@@ -44,6 +52,8 @@ class _MapScreenState extends State<MapScreen> {
   StreamSubscription<Position>? _posSub;
   Position? _lastGps;
 
+  late final TrackRecorder _trackRecorder;
+
   AppScope get _scope => AppScope.of(context);
 
   @override
@@ -51,10 +61,17 @@ class _MapScreenState extends State<MapScreen> {
     super.initState();
     _loadStyle();
     _startGps();
+    _trackRecorder = AppScope.of(context).trackRecorder;
+    _trackRecorder.livePoints.addListener(_onTrackUpdate);
+  }
+
+  void _onTrackUpdate() {
+    _redrawAnnotations();
   }
 
   @override
   void dispose() {
+    _trackRecorder.livePoints.removeListener(_onTrackUpdate);
     _posSub?.cancel();
     super.dispose();
   }
@@ -125,6 +142,8 @@ class _MapScreenState extends State<MapScreen> {
             : null;
       });
     }
+    _lastFingerprint = _libraryFingerprint();
+    _lastDpi = _scope.settings.renderDpi;
   }
 
   Future<void> _addOverlay(
@@ -221,6 +240,8 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  // -------------------------------------------------------------- layers
+
   /// Applies a map's visibility/opacity without re-rendering its PDF
   /// pages: the image source is kept, only the raster layer is re-added.
   Future<void> _applyLayerState(GeoMap map) async {
@@ -265,7 +286,45 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // -------------------------------------------------------------- layers
+  // ------------------------------------------------- public tab API
+
+  /// Re-renders overlays for all visible maps (e.g. after an import).
+  Future<void> refreshOverlays() => _refreshOverlays();
+
+  /// Opens a map: renders its overlay if needed, then zooms to it.
+  Future<void> openMap(GeoMap map) async {
+    await _refreshOverlays();
+    await _zoomToMap(map);
+  }
+
+  /// Called by the home shell when the Map tab becomes visible: refreshes
+  /// overlays only if the library (or render DPI) changed while hidden,
+  /// and always redraws annotations (field data may have changed).
+  Future<void> didBecomeVisible() async {
+    if (_libraryFingerprint() != _lastFingerprint ||
+        _scope.settings.renderDpi != _lastDpi) {
+      await _refreshOverlays();
+    }
+    _updateCoordReadout();
+    await _redrawAnnotations();
+  }
+
+  /// Enters measure mode (idempotent; safe to call when already active).
+  void startMeasureMode() {
+    if (!_measureMode) _toggleMeasure();
+  }
+
+  /// Centers the camera on the current GPS position.
+  Future<void> goToGps() => _goToGps();
+
+  int _libraryFingerprint() {
+    final maps = _scope.library.maps;
+    var h = maps.length * 31 + 7;
+    for (final m in maps) {
+      h = h * 31 + m.id.hashCode + (m.visible ? 1 : 0);
+    }
+    return h;
+  }
 
   void _showLayersSheet() {
     showModalBottomSheet(
@@ -344,6 +403,18 @@ class _MapScreenState extends State<MapScreen> {
         );
       }
     } catch (_) {}
+
+    // In-progress track recording.
+    final liveTrack = _trackRecorder.livePoints.value;
+    if (liveTrack.length >= 2) {
+      await c.addLine(
+        LineOptions(
+          geometry: liveTrack.map((p) => LatLng(p[1], p[0])).toList(),
+          lineColor: '#FF6B1A',
+          lineWidth: 4.0,
+        ),
+      );
+    }
 
     if (_measureMode && _measurePoints.isNotEmpty) {
       await c.addLine(
@@ -547,6 +618,7 @@ class _MapScreenState extends State<MapScreen> {
             MapLibreMap(
               styleString: _styleJson!,
               myLocationEnabled: true,
+              myLocationRenderMode: MyLocationRenderMode.compass,
               myLocationTrackingMode: MyLocationTrackingMode.none,
               initialCameraPosition: const CameraPosition(
                 target: LatLng(-6.2, 106.8), // Jakarta; moves on first import
@@ -566,91 +638,72 @@ class _MapScreenState extends State<MapScreen> {
           SafeArea(
             child: Padding(
               padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 12),
-                      decoration: BoxDecoration(
-                        color: PatokTheme.surface.withValues(alpha: 0.92),
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.map,
-                              color: PatokTheme.accent, size: 20),
-                          const SizedBox(width: 10),
-                          Text(
-                            _measureMode
-                                ? 'Measure: tap the map'
-                                : 'Patok',
-                            style: Theme.of(context).textTheme.titleMedium,
-                          ),
-                        ],
-                      ),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: PatokTheme.surface.withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.map,
+                        color: PatokTheme.accent, size: 20),
+                    const SizedBox(width: 10),
+                    Text(
+                      _measureMode ? 'Measure: tap the map' : 'Patok',
+                      style: Theme.of(context).textTheme.titleMedium,
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  _MenuButton(
-                    onSelected: (v) async {
-                      switch (v) {
-                        case 'library':
-                          await Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                builder: (_) => const LibraryScreen()),
-                          );
-                          await _refreshOverlays();
-                          await _redrawAnnotations();
-                          if (mounted) setState(() {});
-                          break;
-                        case 'import':
-                          final imported =
-                              await Navigator.push<GeoMap>(
-                            context,
-                            MaterialPageRoute(
-                                builder: (_) => const ImportScreen()),
-                          );
-                          await _refreshOverlays();
-                          if (imported != null) {
-                            await _zoomToMap(imported);
-                          }
-                          await _redrawAnnotations();
-                          if (mounted) setState(() {});
-                          break;
-                        case 'tools':
-                          await Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                builder: (_) => const ToolsScreen()),
-                          );
-                          // Waypoints / measurements may have changed.
-                          await _redrawAnnotations();
-                          break;
-                        case 'settings':
-                          final dpiBefore =
-                              _scope.settings.renderDpi;
-                          await Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                builder: (_) =>
-                                    const SettingsScreen()),
-                          );
-                          if (mounted) setState(() {});
-                          _updateCoordReadout();
-                          if (_scope.settings.renderDpi != dpiBefore) {
-                            await _refreshOverlays();
-                          }
-                          await _redrawAnnotations();
-                          break;
-                      }
-                    },
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
+          // Empty state (no maps yet) like the mockup.
+          if (_scope.library.maps.isEmpty)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 48),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 76,
+                      height: 76,
+                      decoration: BoxDecoration(
+                        color: PatokTheme.accent.withValues(alpha: 0.15),
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(24),
+                          topRight: Radius.circular(24),
+                          bottomLeft: Radius.circular(24),
+                          bottomRight: Radius.circular(7),
+                        ),
+                      ),
+                      child: const Icon(Icons.map_outlined,
+                          color: PatokTheme.accent, size: 36),
+                    ),
+                    const SizedBox(height: 18),
+                    Text(
+                      'No map open yet',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Import a georeferenced PDF to start working offline.',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 18),
+                    FilledButton.icon(
+                      onPressed: widget.onBrowseMaps,
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Browse library'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           // Right-side FABs.
           SafeArea(
             child: Align(
@@ -712,46 +765,6 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-class _MenuButton extends StatelessWidget {
-  const _MenuButton({required this.onSelected});
-  final void Function(String) onSelected;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: PatokTheme.surface.withValues(alpha: 0.92),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: PopupMenuButton<String>(
-        icon: const Icon(Icons.more_vert, color: PatokTheme.onBg),
-        onSelected: onSelected,
-        itemBuilder: (_) => const [
-          PopupMenuItem(
-              value: 'library',
-              child: ListTile(
-                  leading: Icon(Icons.folder_open),
-                  title: Text('Map library'))),
-          PopupMenuItem(
-              value: 'import',
-              child: ListTile(
-                  leading: Icon(Icons.file_download),
-                  title: Text('Import map'))),
-          PopupMenuItem(
-              value: 'tools',
-              child: ListTile(
-                  leading: Icon(Icons.build), title: Text('Field tools'))),
-          PopupMenuItem(
-              value: 'settings',
-              child: ListTile(
-                  leading: Icon(Icons.settings),
-                  title: Text('Settings'))),
         ],
       ),
     );

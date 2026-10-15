@@ -323,6 +323,77 @@ class LocationService {
   }
 }
 
+/// Records a GPS track: explicit start/stop, positions collected from the
+/// shared position stream. The live points are exposed so the map can draw
+/// the in-progress track; [stop] returns a [Measurement] to save.
+class TrackRecorder {
+  TrackRecorder(this._locationService);
+  final LocationService _locationService;
+
+  final ValueNotifier<bool> isRecording = ValueNotifier(false);
+  final ValueNotifier<int> pointCount = ValueNotifier(0);
+
+  /// Live (lon, lat) points while recording; empty when idle.
+  final ValueNotifier<List<List<double>>> livePoints =
+      ValueNotifier(const []);
+
+  StreamSubscription<Position>? _sub;
+  final List<List<double>> _points = [];
+
+  Future<void> start() async {
+    if (isRecording.value) return;
+    if (!await _locationService.ensurePermission()) {
+      throw StateError('Location permission denied');
+    }
+    _points.clear();
+    pointCount.value = 0;
+    livePoints.value = const [];
+    _sub = _locationService.positionStream().listen((p) {
+      _points.add([p.longitude, p.latitude]);
+      pointCount.value = _points.length;
+      livePoints.value = List.unmodifiable(_points);
+    });
+    isRecording.value = true;
+  }
+
+  /// Stops recording and returns the track as a [Measurement], or null
+  /// when too few points were collected.
+  Future<Measurement?> stop(String name) async {
+    await _sub?.cancel();
+    _sub = null;
+    isRecording.value = false;
+    final points = List<List<double>>.of(_points);
+    _points.clear();
+    pointCount.value = 0;
+    livePoints.value = const [];
+    if (points.length < 2) return null;
+    var total = 0.0;
+    for (var i = 1; i < points.length; i++) {
+      total += Geolocator.distanceBetween(
+        points[i - 1][1],
+        points[i - 1][0],
+        points[i][1],
+        points[i][0],
+      );
+    }
+    return Measurement(
+      id: _uuid.v4(),
+      name: name,
+      points: points,
+      lengthMeters: total,
+    );
+  }
+
+  Future<void> cancel() async {
+    await _sub?.cancel();
+    _sub = null;
+    isRecording.value = false;
+    _points.clear();
+    pointCount.value = 0;
+    livePoints.value = const [];
+  }
+}
+
 /// App settings backed by SharedPreferences.
 class SettingsService {
   SettingsService._(this._prefs) {

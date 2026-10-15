@@ -127,6 +127,7 @@ class GeoMap {
     required this.pages,
     this.visible = true,
     this.opacity = 1.0,
+    this.isFavorite = false,
     DateTime? addedAt,
   }) : addedAt = addedAt ?? DateTime.now();
 
@@ -140,6 +141,7 @@ class GeoMap {
   final List<GeoMapPage> pages;
   bool visible;
   double opacity;
+  bool isFavorite;
   final DateTime addedAt;
 
   int get georeferencedPages => pages.length;
@@ -151,6 +153,7 @@ class GeoMap {
         'pages': pages.map((p) => p.toJson()).toList(),
         'visible': visible,
         'opacity': opacity,
+        'isFavorite': isFavorite,
         'addedAt': addedAt.toIso8601String(),
       };
 
@@ -163,6 +166,7 @@ class GeoMap {
             .toList(),
         visible: j['visible'] as bool? ?? true,
         opacity: (j['opacity'] as num?)?.toDouble() ?? 1.0,
+        isFavorite: j['isFavorite'] as bool? ?? false,
         addedAt: DateTime.parse(j['addedAt'] as String),
       );
 

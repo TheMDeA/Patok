@@ -10,6 +10,7 @@ class AppScope extends InheritedWidget {
     required this.renderService,
     required this.importService,
     required this.locationService,
+    required this.trackRecorder,
     required this.settings,
     required this.fieldData,
     required super.child,
@@ -19,6 +20,7 @@ class AppScope extends InheritedWidget {
   final RenderService renderService;
   final ImportService importService;
   final LocationService locationService;
+  final TrackRecorder trackRecorder;
   final SettingsService settings;
   final FieldDataStore fieldData;
 
