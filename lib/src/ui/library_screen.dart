@@ -2,20 +2,36 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../dxf/dxf_crs.dart';
+import '../dxf/dxf_import.dart';
 import 'app_scope.dart';
 import '../models.dart';
 import '../theme.dart';
+import 'dxf_import_screen.dart';
 import 'import_screen.dart';
 import 'map_info_sheet.dart';
 
 /// Map library like the approved mockup: search, a "bring your own map"
 /// import card, the offline library grouped by recency, and quick filters.
 class LibraryScreen extends StatefulWidget {
-  const LibraryScreen({super.key, required this.onOpenMap});
+  const LibraryScreen({
+    super.key,
+    required this.onOpenMap,
+    required this.onOpenDxf,
+    required this.onPickPointOnMap,
+  });
 
   /// Called when the user taps a map: the home shell switches to the
   /// Map tab and zooms to it.
   final void Function(GeoMap) onOpenMap;
+
+  /// Called when the user taps a DXF drawing: switches to the Map tab
+  /// and zooms to it.
+  final void Function(DxfImport) onOpenDxf;
+
+  /// Map-tab point picker for DXF grid calibration.
+  final Future<({double lon, double lat})?> Function(String prompt)
+      onPickPointOnMap;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -34,6 +50,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   GeoMap? _lastDeletedMap;
   File? _lastDeletedBackup;
 
+  /// Last deleted DXF import + its files moved aside, for snackbar undo.
+  DxfImport? _lastDeletedDxf;
+  final List<File> _lastDeletedDxfBackups = [];
+
   @override
   void initState() {
     super.initState();
@@ -50,6 +70,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
       } catch (_) {
         // File missing (e.g. mid-import): leave the size blank.
       }
+    }
+    for (final d in lib.dxfImports) {
+      try {
+        final bytes = File(lib.dxfPath(d)).statSync().size;
+        _sizes[d.id] = _fmtSize(bytes);
+      } catch (_) {}
     }
   }
 
@@ -90,6 +116,119 @@ class _LibraryScreenState extends State<LibraryScreen> {
     } else if (mounted) {
       setState(() {});
     }
+  }
+
+  List<DxfImport> get _visibleDxfs {
+    final dxfs = AppScope.of(context).library.dxfImports;
+    var list = dxfs.where((d) {
+      if (_query.isEmpty) return true;
+      return d.name.toLowerCase().contains(_query.toLowerCase());
+    }).toList();
+    list.sort((a, b) => b.addedAt.compareTo(a.addedAt));
+    return list;
+  }
+
+  /// DXF import with map-pick round-trips: the import screen pops with
+  /// [DxfPickRequested] when the user taps "Map", we run the pick on the
+  /// Map tab, store it in the flow, and re-push the screen.
+  Future<void> _importDxf() async {
+    final flow = DxfImportFlow();
+    while (mounted) {
+      final result = await Navigator.push<dynamic>(
+        context,
+        MaterialPageRoute(builder: (_) => DxfImportScreen(flow: flow)),
+      );
+      if (result is DxfImport) {
+        _refreshSizes();
+        setState(() {});
+        widget.onOpenDxf(result);
+        return;
+      }
+      if (result is DxfPickRequested) {
+        final pt = await widget.onPickPointOnMap(result.prompt);
+        if (pt != null) {
+          flow.setRealPosition(result.pointIndex, pt.lon, pt.lat);
+        }
+        // Re-push with the preserved flow (null pick = user cancelled;
+        // the step is simply shown again).
+        continue;
+      }
+      if (mounted) setState(() {});
+      return;
+    }
+  }
+
+  Future<void> _deleteDxf(DxfImport d) async {
+    final scope = AppScope.of(context);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete drawing?'),
+        content: Text(
+            '"${d.name}" and its ${d.cadLayers.length} CAD layer(s) will be removed.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      // Drop any older pending-undo backup first.
+      for (final b in _lastDeletedDxfBackups) {
+        try {
+          await b.delete();
+        } catch (_) {}
+      }
+      _lastDeletedDxf = null;
+      _lastDeletedDxfBackups.clear();
+      // Move the DXF + cache aside instead of deleting, for Undo.
+      for (final p in [scope.library.dxfPath(d), scope.library.dxfCachePath(d)]) {
+        try {
+          final f = File(p);
+          if (await f.exists()) {
+            final backup = File('$p.undo');
+            await f.rename(backup.path);
+            _lastDeletedDxfBackups.add(backup);
+          }
+        } catch (_) {}
+      }
+      if (_lastDeletedDxfBackups.isNotEmpty) _lastDeletedDxf = d;
+      await scope.library.removeDxf(d);
+      _sizes.remove(d.id);
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('"${d.name}" deleted'),
+            action: SnackBarAction(label: 'Undo', onPressed: _undoDeleteDxf),
+          ),
+        );
+      }
+    }
+  }
+
+  /// Restores the last deleted DXF import (files moved back, entry re-added).
+  Future<void> _undoDeleteDxf() async {
+    final d = _lastDeletedDxf;
+    final backups = List<File>.from(_lastDeletedDxfBackups);
+    _lastDeletedDxf = null;
+    _lastDeletedDxfBackups.clear();
+    if (d == null || backups.isEmpty || !mounted) return;
+    final scope = AppScope.of(context);
+    for (final backup in backups) {
+      try {
+        final orig = backup.path.replaceAll(RegExp(r'\.undo$'), '');
+        await backup.rename(orig);
+      } catch (_) {}
+    }
+    scope.library.dxfImports.add(d);
+    await scope.library.save();
+    _refreshSizes();
+    if (mounted) setState(() {});
   }
 
   Future<void> _toggleFavorite(GeoMap m) async {
@@ -249,13 +388,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                FilledButton(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: Colors.black,
-                    foregroundColor: Colors.white,
-                  ),
-                  onPressed: _import,
-                  child: const Text('Import PDF'),
+                Row(
+                  children: [
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.black,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: _import,
+                      child: const Text('Import PDF'),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.black,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: _importDxf,
+                      child: const Text('Import DXF'),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -342,6 +494,57 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ),
             ],
           ),
+          const SizedBox(height: 20),
+          Text(
+            'DXF DRAWINGS',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  letterSpacing: 1.2,
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(height: 10),
+          Builder(builder: (context) {
+            final dxfs = _visibleDxfs;
+            if (dxfs.isEmpty) {
+              return Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color: PatokTheme.onSurfaceDim.withValues(alpha: 0.4),
+                  ),
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'No DXF drawings yet',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Import a mine plan DXF (UTM or local grid) to overlay its linework.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              );
+            }
+            return Column(
+              children: [
+                for (final d in dxfs)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: _DxfCard(
+                      drawing: d,
+                      sizeLabel: _sizes[d.id],
+                      onOpen: () => widget.onOpenDxf(d),
+                      onDelete: () => _deleteDxf(d),
+                    ),
+                  ),
+              ],
+            );
+          }),
         ],
       ),
     );
@@ -509,6 +712,78 @@ class _MapCard extends StatelessWidget {
                 ),
                 tooltip: 'Favorite',
                 onPressed: onToggleFavorite,
+              ),
+              IconButton(
+                icon: const Icon(Icons.delete_outline),
+                onPressed: onDelete,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Library card for an imported DXF drawing.
+class _DxfCard extends StatelessWidget {
+  const _DxfCard({
+    required this.drawing,
+    required this.sizeLabel,
+    required this.onOpen,
+    required this.onDelete,
+  });
+  final DxfImport drawing;
+
+  /// Formatted DXF file size (e.g. "2.4 MB"), or null when unknown.
+  final String? sizeLabel;
+  final VoidCallback onOpen;
+  final VoidCallback onDelete;
+
+  String _crsLabel() => switch (drawing.crs) {
+        DxfUtm(:var zone, :var southernHemisphere) =>
+          'UTM $zone${southernHemisphere ? 'S' : 'N'}',
+        DxfLocalGrid(:var name) => name,
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onOpen,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: PatokTheme.accent.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child:
+                    const Icon(Icons.polyline, color: PatokTheme.accent),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(drawing.name,
+                        style: Theme.of(context).textTheme.titleMedium),
+                    const SizedBox(height: 4),
+                    Text(
+                      [
+                        if (sizeLabel case final sl) sl,
+                        '${drawing.cadLayers.length} CAD layer(s)',
+                        _crsLabel(),
+                      ].join(' • '),
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
               ),
               IconButton(
                 icon: const Icon(Icons.delete_outline),

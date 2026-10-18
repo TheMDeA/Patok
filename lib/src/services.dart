@@ -13,6 +13,8 @@ import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import 'dxf/dxf_crs.dart';
+import 'dxf/dxf_import.dart';
 import 'geopdf/georef.dart';
 import 'geopdf/pdf_parser.dart';
 import 'models.dart';
@@ -49,33 +51,59 @@ Future<Directory> _appDir() async {
   return dir;
 }
 
-/// Persistent library of imported maps (JSON index + copied PDFs).
+/// Persistent library of imported maps (JSON index + copied PDFs)
+/// and imported DXF drawings (JSON index + transformed geometry cache).
 class MapLibrary {
-  MapLibrary._(this._dir, this.maps);
+  MapLibrary._(this._dir, this.maps, this.dxfImports);
   final Directory _dir;
   final List<GeoMap> maps;
+  final List<DxfImport> dxfImports;
 
   static Future<MapLibrary> load() async {
     final dir = await _appDir();
     final file = File('${dir.path}/library.json');
-    if (!await file.exists()) return MapLibrary._(dir, []);
+    if (!await file.exists()) return MapLibrary._(dir, [], []);
     try {
-      final maps = GeoMap.decodeList(await file.readAsString());
+      final raw = jsonDecode(await file.readAsString());
+      // New format is {"maps": [...], "dxfImports": [...]}; the original
+      // format was a bare array of maps.
+      final mapsJson = raw is List ? raw : (raw['maps'] as List? ?? []);
+      final dxfJson =
+          raw is Map ? (raw['dxfImports'] as List? ?? []) : const [];
+      final maps = mapsJson
+          .map((j) => GeoMap.fromJson(j as Map<String, dynamic>))
+          .toList();
       // Drop entries whose PDF is missing.
       maps.removeWhere(
         (m) => !File('${dir.path}/${m.relativePdfPath}').existsSync(),
       );
-      return MapLibrary._(dir, maps);
+      final dxfs = dxfJson
+          .map((j) => DxfImport.fromJson(j as Map<String, dynamic>))
+          .toList();
+      // Drop entries whose geometry cache is missing.
+      dxfs.removeWhere(
+        (d) => !File('${dir.path}/${d.relativeCachePath}').existsSync(),
+      );
+      return MapLibrary._(dir, maps, dxfs);
     } catch (_) {
-      return MapLibrary._(dir, []);
+      return MapLibrary._(dir, [], []);
     }
   }
 
   String pdfPath(GeoMap map) => '${_dir.path}/${map.relativePdfPath}';
+  String dxfPath(DxfImport d) => '${_dir.path}/${d.relativeDxfPath}';
+  String dxfCachePath(DxfImport d) => '${_dir.path}/${d.relativeCachePath}';
+
+  /// Named mine local grids, stored alongside the library.
+  Future<DxfLocalGridStore> dxfLocalGrids() =>
+      DxfLocalGridStore.load(_dir);
 
   Future<void> save() async {
     final file = File('${_dir.path}/library.json');
-    await file.writeAsString(GeoMap.encodeList(maps));
+    await file.writeAsString(jsonEncode({
+      'maps': maps.map((m) => m.toJson()).toList(),
+      'dxfImports': dxfImports.map((d) => d.toJson()).toList(),
+    }));
   }
 
   Future<void> add(GeoMap map) async {
@@ -87,6 +115,22 @@ class MapLibrary {
     maps.removeWhere((m) => m.id == map.id);
     final pdf = File(pdfPath(map));
     if (await pdf.exists()) await pdf.delete();
+    await save();
+  }
+
+  Future<void> addDxf(DxfImport d) async {
+    dxfImports.add(d);
+    await save();
+  }
+
+  Future<void> removeDxf(DxfImport d) async {
+    dxfImports.removeWhere((x) => x.id == d.id);
+    for (final p in [dxfPath(d), dxfCachePath(d)]) {
+      try {
+        final f = File(p);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
     await save();
   }
 }
@@ -564,6 +608,75 @@ class ImportService {
     } catch (_) {}
     return map;
   }
+
+  /// Lets the user pick a DXF and parses it (no CRS yet). Returns null if
+  /// the user cancelled. The CRS choice + transform happen in
+  /// [commitDxfImport].
+  Future<DxfParseResult?> pickAndParseDxf(
+    void Function(String message) onProgress,
+  ) async {
+    final files = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['dxf'],
+    );
+    if (files.isEmpty) return null;
+    final path = files.single.path;
+    if (path == null) throw StateError('Picked file has no path');
+    onProgress('Parsing DXF…');
+    final parsed = parseDxfFile(path);
+    if (parsed.doc.entities.isEmpty) {
+      throw StateError(
+        'No supported entities found in this DXF. Patok reads LINE, '
+        'LWPOLYLINE/POLYLINE, POINT, TEXT, CIRCLE, ARC, HATCH and INSERT.',
+      );
+    }
+    return parsed;
+  }
+
+  /// Transforms a parsed DXF into lon/lat with [crs], writes the geometry
+  /// cache + a copy of the source file, and registers the import.
+  Future<DxfImport> commitDxfImport({
+    required DxfParseResult parsed,
+    required DxfCrs crs,
+    required String name,
+    required void Function(String message) onProgress,
+  }) async {
+    final dir = await _appDir();
+    final id = _uuid.v4();
+
+    onProgress('Copying file…');
+    final dxfDir = Directory('${dir.path}/dxf');
+    if (!await dxfDir.exists()) await dxfDir.create(recursive: true);
+    await File(parsed.sourcePath).copy('${dxfDir.path}/$id.dxf');
+
+    onProgress('Projecting geometry…');
+    final bounds = <double>[];
+    final features = buildDxfFeatures(
+      parsed.doc,
+      crs,
+      bounds,
+      onProgress: (done, total) =>
+          onProgress('Projecting geometry… ${(done / total * 100).round()}%'),
+    );
+    if (features.isEmpty) {
+      throw StateError('Nothing renderable survived the projection.');
+    }
+
+    onProgress('Writing cache…');
+    await writeDxfCache(dir, id, features);
+
+    final imp = DxfImport(
+      id: id,
+      name: name,
+      fileName: parsed.fileName,
+      crs: crs,
+      bounds: bounds,
+      cadLayers: {for (final k in features.keys) k: true},
+    );
+    onProgress('Saving to library…');
+    await _library.addDxf(imp);
+    return imp;
+  }
 }
 
 /// Small page previews for library cards, cached on disk under
@@ -777,6 +890,14 @@ class SettingsService {
   /// (keeps PDF text sharp like a native viewer). Default on.
   bool get detailZoom => _prefs.getBool('detailZoom') ?? true;
   Future<void> setDetailZoom(bool v) => _prefs.setBool('detailZoom', v);
+
+  /// Last DXF import UTM zone/hemisphere (remembered for next import).
+  int get lastDxfUtmZone => _prefs.getInt('lastDxfUtmZone') ?? 50;
+  bool get lastDxfUtmSouth => _prefs.getBool('lastDxfUtmSouth') ?? true;
+  Future<void> setLastDxfUtm(int zone, bool south) async {
+    await _prefs.setInt('lastDxfUtmZone', zone);
+    await _prefs.setBool('lastDxfUtmSouth', south);
+  }
 }
 
 /// GNSS satellite status streamed from the Android side.
