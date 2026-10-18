@@ -1,9 +1,9 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import '../models.dart';
+import '../share_intent_service.dart';
 import '../theme.dart';
 import '../update_service.dart';
 import 'field_screen.dart';
@@ -49,19 +49,15 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
     });
-    // "Open with Patok": a PDF shared from another app (cold start).
-    final rsi = ReceiveSharingIntent.instance;
-    rsi.getInitialMedia().then((files) {
-      if (files.isNotEmpty && mounted) _importShared(files.first.path);
-      rsi.reset();
-    });
-    // Same, while the app is already running.
-    _shareSub = rsi.getMediaStream().listen((files) {
-      if (files.isNotEmpty && mounted) _importShared(files.first.path);
+    // "Open with Patok": a PDF shared from another app. Cold-start shares
+    // are buffered natively and delivered on first listen; later shares
+    // arrive live on the same stream.
+    _shareSub = ShareIntentService().sharedPdfStream.listen((path) {
+      if (mounted) _importShared(path);
     });
   }
 
-  StreamSubscription<List<SharedMediaFile>>? _shareSub;
+  StreamSubscription<String>? _shareSub;
 
   /// Imports a PDF shared from another app, then opens it on the map.
   Future<void> _importShared(String path) async {

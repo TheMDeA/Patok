@@ -19,6 +19,13 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         setupGnssChannel(flutterEngine)
         setupUpdateChannel(flutterEngine)
+        setupShareChannel(flutterEngine)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
     }
 
     // Streams GNSS satellite counts to Dart: {"used": n, "total": m}.
@@ -110,6 +117,64 @@ class MainActivity : FlutterActivity() {
             } else {
                 result.notImplemented()
             }
+        }
+    }
+
+    // "Open with Patok": a PDF shared from another app arrives as
+    // ACTION_SEND (EXTRA_STREAM) or ACTION_VIEW (data). The content URI is
+    // copied into the app cache and its path is delivered to Dart —
+    // buffered when nobody is listening yet (cold start), pushed live when
+    // the stream is active (app already running).
+    private var shareSink: EventChannel.EventSink? = null
+    private var pendingSharedPdf: String? = null
+
+    private fun setupShareChannel(flutterEngine: FlutterEngine) {
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "patok/share",
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(args: Any?, events: EventChannel.EventSink) {
+                shareSink = events
+                pendingSharedPdf?.let {
+                    events.success(it)
+                    pendingSharedPdf = null
+                }
+            }
+
+            override fun onCancel(args: Any?) {
+                shareSink = null
+            }
+        })
+        // Cold start: the share intent arrived before the engine existed.
+        handleShareIntent(intent)
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        val uri: Uri? = when (intent?.action) {
+            Intent.ACTION_SEND -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+            }
+            Intent.ACTION_VIEW -> intent.data
+            else -> null
+        } ?: return
+        val path = copySharedPdfToCache(uri) ?: return
+        shareSink?.success(path) ?: run { pendingSharedPdf = path }
+    }
+
+    private fun copySharedPdfToCache(uri: Uri): String? {
+        return try {
+            val dest = File(cacheDir, "shared_${System.currentTimeMillis()}.pdf")
+            contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            } ?: return null
+            dest.absolutePath
+        } catch (_: Exception) {
+            null
         }
     }
 }

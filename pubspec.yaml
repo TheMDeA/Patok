@@ -45,9 +45,6 @@ dependencies:
   shared_preferences: ^2.5.6
   http: ^1.4.0
   package_info_plus: ^10.2.2
-  # Pinned: 1.9.0 requires compileSdk 37 (project is on 36). 1.8.1 has the
-  # same instance API and compiles against SDK 34.
-  receive_sharing_intent: 1.8.1
 
 dev_dependencies:
   flutter_test:
