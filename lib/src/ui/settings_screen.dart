@@ -105,7 +105,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Patok 1.0.1',
+                  Text('Patok 1.0.2',
                       style: TextStyle(fontWeight: FontWeight.w600)),
                   SizedBox(height: 8),
                   Text(

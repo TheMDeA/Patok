@@ -95,6 +95,10 @@ class MapScreenState extends State<MapScreen> {
   String _layerId(GeoMap m, GeoMapPage p) => 'fa_lyr_${m.id}_${p.pageIndex}';
 
   Future<void> _onStyleLoaded() async {
+    // A style reload wipes all custom layers/sources: rebuild the
+    // annotation stack first so the PDF overlays below can reference it.
+    _annLayersReady = false;
+    await _ensureAnnotationLayers();
     await _refreshOverlays();
     await _redrawAnnotations();
   }
@@ -102,6 +106,9 @@ class MapScreenState extends State<MapScreen> {
   Future<void> _refreshOverlays() async {
     final c = _controller;
     if (c == null) return;
+    // Annotation layers must exist before raster overlays reference them
+    // via belowLayerId (no-op when already ready).
+    await _ensureAnnotationLayers();
     // Remove old overlay layers/sources.
     for (final id in _layerIds) {
       try {
@@ -164,15 +171,29 @@ class MapScreenState extends State<MapScreen> {
     final sid = _sourceId(map, page);
     final lid = _layerId(map, page);
     await c.addImageSource(sid, overlay.pngBytes, quad);
-    await c.addRasterLayer(
-      sid,
-      lid,
-      RasterLayerProperties(rasterOpacity: map.opacity),
-    );
+    await _addPdfRasterLayer(c, sid, lid, map.opacity);
     _sourceIds.add(sid);
     _layerIds.add(lid);
   }
 
+  /// Adds a PDF raster layer, always *below* the annotation stack so
+  /// waypoints/measurements can never be buried by an overlay re-add.
+  Future<void> _addPdfRasterLayer(
+    MapLibreMapController c,
+    String sid,
+    String lid,
+    double opacity,
+  ) async {
+    final props = RasterLayerProperties(rasterOpacity: opacity);
+    try {
+      await c.addRasterLayer(sid, lid, props, belowLayerId: _lyrGrid);
+    } catch (_) {
+      // Annotation layers not ready: add on top; the next
+      // _ensureAnnotationLayers pass restores the order.
+      await c.addRasterLayer(sid, lid, props);
+    }
+  }
+  ///
   /// Guards the native map against out-of-range coordinates.
   ///
   /// When a PDF's coordinate system can't be resolved (e.g. a projected
@@ -258,11 +279,7 @@ class MapScreenState extends State<MapScreen> {
           await _refreshOverlays();
           return;
         }
-        await c.addRasterLayer(
-          sid,
-          lid,
-          RasterLayerProperties(rasterOpacity: map.opacity),
-        );
+        await _addPdfRasterLayer(c, sid, lid, map.opacity);
         _layerIds.add(lid);
       } else if (!map.visible && hasLayer) {
         try {
@@ -276,11 +293,7 @@ class MapScreenState extends State<MapScreen> {
           await c.removeLayer(lid);
         } catch (_) {}
         _layerIds.remove(lid);
-        await c.addRasterLayer(
-          sid,
-          lid,
-          RasterLayerProperties(rasterOpacity: map.opacity),
-        );
+        await _addPdfRasterLayer(c, sid, lid, map.opacity);
         _layerIds.add(lid);
       }
     }
@@ -352,181 +365,301 @@ class MapScreenState extends State<MapScreen> {
   }
 
   // ---------------------------------------------------------- annotations
-  // Single clear + redraw for everything drawn above the map: UTM grid
-  // (if enabled) -> saved measurements -> waypoints -> the active
-  // measure line. Unified so measure mode never wipes field data and
-  // z-order stays correct.
+  // Annotation layers are managed directly through the style API — not
+  // through the plugin's annotation managers. Two reasons:
+  //  1. z-order: PDF raster overlays are added with belowLayerId pointing
+  //     at the bottom of this stack, so _refreshOverlays() can never bury
+  //     waypoints/measurements again (the old managers' layers were
+  //     re-buried on every openMap, and redraws kept them buried).
+  //  2. lifecycle: stable layer IDs, re-created after every style load;
+  //     no silent "manager not initialized" swallows.
+  // Stack, bottom -> top: grid, saved measurements, live track,
+  // measure line + points, waypoints.
 
+  static const _srcGrid = 'patok_src_grid';
+  static const _lyrGrid = 'patok_lyr_grid';
+  static const _srcMeasurements = 'patok_src_measurements';
+  static const _lyrMeasurements = 'patok_lyr_measurements';
+  static const _srcTrack = 'patok_src_track';
+  static const _lyrTrack = 'patok_lyr_track';
+  static const _srcMeasure = 'patok_src_measure';
+  static const _lyrMeasureLine = 'patok_lyr_measure_line';
+  static const _lyrMeasurePts = 'patok_lyr_measure_pts';
+  static const _srcWaypoints = 'patok_src_waypoints';
+  static const _lyrWaypoints = 'patok_lyr_waypoints';
+
+  bool _annLayersReady = false;
+
+  static Map<String, dynamic> _emptyFc() =>
+      {'type': 'FeatureCollection', 'features': []};
+
+  static Map<String, dynamic> _pointsFc(Iterable<List<double>> lonLat) => {
+        'type': 'FeatureCollection',
+        'features': [
+          for (final p in lonLat)
+            {
+              'type': 'Feature',
+              'geometry': {
+                'type': 'Point',
+                'coordinates': [p[0], p[1]],
+              },
+              'properties': {},
+            },
+        ],
+      };
+
+  static Map<String, dynamic> _linesFc(Iterable<Iterable<List<double>>> lines) =>
+      {
+        'type': 'FeatureCollection',
+        'features': [
+          for (final line in lines)
+            {
+              'type': 'Feature',
+              'geometry': {
+                'type': 'LineString',
+                'coordinates': [
+                  for (final p in line) [p[0], p[1]],
+                ],
+              },
+              'properties': {},
+            },
+        ],
+      };
+
+  /// Creates the annotation sources/layers. Idempotent per style load;
+  /// must run before any raster overlay is added with belowLayerId.
+  Future<void> _ensureAnnotationLayers() async {
+    final c = _controller;
+    if (c == null || _annLayersReady) return;
+    try {
+      // Clean up any partial previous run first.
+      for (final lid in [
+        _lyrGrid,
+        _lyrMeasurements,
+        _lyrTrack,
+        _lyrMeasureLine,
+        _lyrMeasurePts,
+        _lyrWaypoints,
+      ]) {
+        try {
+          await c.removeLayer(lid);
+        } catch (_) {}
+      }
+      for (final sid in [
+        _srcGrid,
+        _srcMeasurements,
+        _srcTrack,
+        _srcMeasure,
+        _srcWaypoints,
+      ]) {
+        try {
+          await c.removeSource(sid);
+        } catch (_) {}
+      }
+      await c.addGeoJsonSource(_srcGrid, _emptyFc());
+      await c.addLineLayer(
+        _srcGrid,
+        _lyrGrid,
+        const LineLayerProperties(
+            lineColor: '#9AA7B2', lineWidth: 1.0, lineOpacity: 0.45),
+      );
+      await c.addGeoJsonSource(_srcMeasurements, _emptyFc());
+      await c.addLineLayer(
+        _srcMeasurements,
+        _lyrMeasurements,
+        const LineLayerProperties(lineColor: '#4CAF50', lineWidth: 3.0),
+      );
+      await c.addGeoJsonSource(_srcTrack, _emptyFc());
+      await c.addLineLayer(
+        _srcTrack,
+        _lyrTrack,
+        const LineLayerProperties(lineColor: '#FF6B1A', lineWidth: 4.0),
+      );
+      await c.addGeoJsonSource(_srcMeasure, _emptyFc());
+      await c.addLineLayer(
+        _srcMeasure,
+        _lyrMeasureLine,
+        const LineLayerProperties(lineColor: '#FF6B1A', lineWidth: 4.0),
+      );
+      await c.addCircleLayer(
+        _srcMeasure,
+        _lyrMeasurePts,
+        const CircleLayerProperties(
+            circleRadius: 7.0,
+            circleColor: '#FF6B1A',
+            circleStrokeWidth: 2.0,
+            circleStrokeColor: '#000000'),
+      );
+      await c.addGeoJsonSource(_srcWaypoints, _emptyFc());
+      await c.addCircleLayer(
+        _srcWaypoints,
+        _lyrWaypoints,
+        const CircleLayerProperties(
+            circleRadius: 8.0,
+            circleColor: '#2196F3',
+            circleStrokeWidth: 2.0,
+            circleStrokeColor: '#FFFFFF'),
+      );
+      _annLayersReady = true;
+    } catch (e) {
+      debugPrint('Patok: annotation layers failed: $e');
+      _annLayersReady = false;
+    }
+  }
+
+  /// Single clear + redraw for everything above the map: UTM grid (if
+  /// enabled) -> saved measurements -> live track -> measure line ->
+  /// waypoints. Only rewrites GeoJSON data; layer order never changes.
   Future<void> _redrawAnnotations() async {
     final c = _controller;
-    if (c == null) return;
+    if (c == null || !_annLayersReady) return;
     try {
-      await c.clearLines();
-    } catch (_) {}
-    try {
-      await c.clearCircles();
-    } catch (_) {}
+      // UTM grid.
+      if (_scope.settings.showUtmGrid) {
+        await c.setGeoJsonSource(
+            _srcGrid, _linesFc(await _gridLineCoords(c)));
+      } else {
+        await c.setGeoJsonSource(_srcGrid, _emptyFc());
+      }
 
-    if (_scope.settings.showUtmGrid) {
-      await _drawUtmGrid(c);
-    }
-
-    try {
+      // Saved measurements (green).
       final ms = await _scope.fieldData.measurements();
-      if (ms.isNotEmpty) {
-        await c.addLines(
-          ms
-              .map((m) => LineOptions(
-                    geometry:
-                        m.points.map((p) => LatLng(p[1], p[0])).toList(),
-                    lineColor: '#4CAF50',
-                    lineWidth: 3.0,
-                  ))
-              .toList(),
-        );
-      }
-    } catch (_) {}
+      await c.setGeoJsonSource(
+          _srcMeasurements, _linesFc(ms.map((m) => m.points)));
 
-    try {
+      // In-progress track recording (orange).
+      final liveTrack = _trackRecorder.livePoints.value;
+      await c.setGeoJsonSource(
+        _srcTrack,
+        liveTrack.length >= 2 ? _linesFc([liveTrack]) : _emptyFc(),
+      );
+
+      // Active measure line + vertices.
+      if (_measureMode && _measurePoints.isNotEmpty) {
+        final pts = _measurePoints
+            .map((p) => [p.longitude, p.latitude])
+            .toList();
+        await c.setGeoJsonSource(_srcMeasure, {
+          'type': 'FeatureCollection',
+          'features': [
+            if (pts.length >= 2)
+              {
+                'type': 'Feature',
+                'geometry': {
+                  'type': 'LineString',
+                  'coordinates': pts,
+                },
+                'properties': {},
+              },
+            for (final p in pts)
+              {
+                'type': 'Feature',
+                'geometry': {
+                  'type': 'Point',
+                  'coordinates': p,
+                },
+                'properties': {},
+              },
+          ],
+        });
+      } else {
+        await c.setGeoJsonSource(_srcMeasure, _emptyFc());
+      }
+
+      // Waypoints (blue pins).
       final wps = await _scope.fieldData.waypoints();
-      if (wps.isNotEmpty) {
-        await c.addCircles(
-          wps
-              .map((w) => CircleOptions(
-                    geometry: LatLng(w.latitude, w.longitude),
-                    circleRadius: 8.0,
-                    circleColor: '#2196F3',
-                    circleStrokeWidth: 2.0,
-                    circleStrokeColor: '#FFFFFF',
-                  ))
-              .toList(),
-        );
-      }
-    } catch (_) {}
-
-    // In-progress track recording.
-    final liveTrack = _trackRecorder.livePoints.value;
-    if (liveTrack.length >= 2) {
-      await c.addLine(
-        LineOptions(
-          geometry: liveTrack.map((p) => LatLng(p[1], p[0])).toList(),
-          lineColor: '#FF6B1A',
-          lineWidth: 4.0,
-        ),
+      await c.setGeoJsonSource(
+        _srcWaypoints,
+        _pointsFc(wps.map((w) => [w.longitude, w.latitude])),
       );
-    }
-
-    if (_measureMode && _measurePoints.isNotEmpty) {
-      await c.addLine(
-        LineOptions(
-          geometry: List.of(_measurePoints),
-          lineColor: '#FF6B1A',
-          lineWidth: 4.0,
-        ),
-      );
-      await c.addCircles(
-        _measurePoints
-            .map((p) => CircleOptions(
-                  geometry: p,
-                  circleRadius: 7.0,
-                  circleColor: '#FF6B1A',
-                  circleStrokeWidth: 2.0,
-                  circleStrokeColor: '#000000',
-                ))
-            .toList(),
-      );
+    } catch (e) {
+      debugPrint('Patok: _redrawAnnotations failed: $e');
     }
     if (mounted) setState(() {});
   }
 
-  /// Draws a UTM grid over the visible region. Line spacing follows zoom.
-  Future<void> _drawUtmGrid(MapLibreMapController c) async {
-    try {
-      final pos = c.cameraPosition;
-      if (pos == null) return;
-      final region = await c.getVisibleRegion();
-      final zoom = pos.zoom;
-      final interval = zoom >= 15
-          ? 500.0
-          : zoom >= 13
-              ? 1000.0
-              : zoom >= 11
-                  ? 2000.0
-                  : zoom >= 9
-                      ? 5000.0
-                      : 10000.0;
-      final centerLon =
-          (region.northeast.longitude + region.southwest.longitude) / 2;
-      final centerLat =
-          (region.northeast.latitude + region.southwest.latitude) / 2;
-      final zone = ((centerLon + 180) / 6).floor() + 1;
-      final utm = proj4.Projection.parse(
-        '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
-        '${centerLat < 0 ? ' +south' : ''}',
-      );
-      math.Point<double> toUtm(double lon, double lat) {
-        final p = proj4.Projection.WGS84.transform(
-            utm, proj4.Point(x: lon, y: lat));
-        return math.Point(p.x, p.y);
-      }
-
-      final sw = toUtm(
-          region.southwest.longitude, region.southwest.latitude);
-      final ne = toUtm(
-          region.northeast.longitude, region.northeast.latitude);
-      final minE = math.min(sw.x, ne.x), maxE = math.max(sw.x, ne.x);
-      final minN = math.min(sw.y, ne.y), maxN = math.max(sw.y, ne.y);
-
-      const maxLines = 40;
-      final lines = <LineOptions>[];
-      var e = (minE / interval).floor() * interval;
-      var count = 0;
-      while (e <= maxE && count < maxLines) {
-        lines.add(_utmGridLine(utm, easting: e, minN: minN, maxN: maxN));
-        e += interval;
-        count++;
-      }
-      var n = (minN / interval).floor() * interval;
-      count = 0;
-      while (n <= maxN && count < maxLines) {
-        lines.add(_utmGridLine(utm, northing: n, minE: minE, maxE: maxE));
-        n += interval;
-        count++;
-      }
-      if (lines.isNotEmpty) await c.addLines(lines);
-    } catch (_) {}
-  }
-
-  LineOptions _utmGridLine(
-    proj4.Projection utm, {
-    double? easting,
-    double? northing,
-    double? minE,
-    double? maxE,
-    double? minN,
-    double? maxN,
-  }) {
-    const samples = 24;
-    final pts = <LatLng>[];
-    for (var i = 0; i <= samples; i++) {
-      double x, y;
-      if (easting != null) {
-        x = easting;
-        y = minN! + (maxN! - minN) * i / samples;
-      } else {
-        x = minE! + (maxE! - minE) * i / samples;
-        y = northing!;
-      }
-      final p =
-          utm.transform(proj4.Projection.WGS84, proj4.Point(x: x, y: y));
-      pts.add(LatLng(p.y, p.x));
-    }
-    return LineOptions(
-      geometry: pts,
-      lineColor: '#9AA7B2',
-      lineWidth: 1.0,
-      lineOpacity: 0.45,
+  /// UTM grid line coordinates ([lon, lat] pairs) for the visible region.
+  /// Line spacing follows zoom. Returns empty when the region is unknown.
+  Future<List<List<List<double>>>> _gridLineCoords(
+      MapLibreMapController c) async {
+    final pos = c.cameraPosition;
+    if (pos == null) return [];
+    final region = await c.getVisibleRegion();
+    final zoom = pos.zoom;
+    final interval = zoom >= 15
+        ? 500.0
+        : zoom >= 13
+            ? 1000.0
+            : zoom >= 11
+                ? 2000.0
+                : zoom >= 9
+                    ? 5000.0
+                    : 10000.0;
+    final centerLon =
+        (region.northeast.longitude + region.southwest.longitude) / 2;
+    final centerLat =
+        (region.northeast.latitude + region.southwest.latitude) / 2;
+    final zone = ((centerLon + 180) / 6).floor() + 1;
+    final utm = proj4.Projection.parse(
+      '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
+      '${centerLat < 0 ? ' +south' : ''}',
     );
+    math.Point<double> toUtm(double lon, double lat) {
+      final p = proj4.Projection.WGS84.transform(
+          utm, proj4.Point(x: lon, y: lat));
+      return math.Point(p.x, p.y);
+    }
+
+    final sw =
+        toUtm(region.southwest.longitude, region.southwest.latitude);
+    final ne =
+        toUtm(region.northeast.longitude, region.northeast.latitude);
+    final minE = math.min(sw.x, ne.x), maxE = math.max(sw.x, ne.x);
+    final minN = math.min(sw.y, ne.y), maxN = math.max(sw.y, ne.y);
+
+    List<List<double>> gridLine({
+      double? easting,
+      double? northing,
+      double? minE,
+      double? maxE,
+      double? minN,
+      double? maxN,
+    }) {
+      const samples = 24;
+      final pts = <List<double>>[];
+      for (var i = 0; i <= samples; i++) {
+        double x, y;
+        if (easting != null) {
+          x = easting;
+          y = minN! + (maxN! - minN) * i / samples;
+        } else {
+          x = minE! + (maxE! - minE) * i / samples;
+          y = northing!;
+        }
+        final p =
+            utm.transform(proj4.Projection.WGS84, proj4.Point(x: x, y: y));
+        pts.add([p.x, p.y]);
+      }
+      return pts;
+    }
+
+    const maxLines = 40;
+    final lines = <List<List<double>>>[];
+    var e = (minE / interval).floor() * interval;
+    var count = 0;
+    while (e <= maxE && count < maxLines) {
+      lines.add(gridLine(easting: e, minN: minN, maxN: maxN));
+      e += interval;
+      count++;
+    }
+    var n = (minN / interval).floor() * interval;
+    count = 0;
+    while (n <= maxN && count < maxLines) {
+      lines.add(gridLine(northing: n, minE: minE, maxE: maxE));
+      n += interval;
+      count++;
+    }
+    return lines;
   }
 
   // -------------------------------------------------------------- measure

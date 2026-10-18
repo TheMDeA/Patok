@@ -5,6 +5,12 @@ and concise.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-18
+
+### Fixed
+- Waypoints and saved measurements now appear on the map (map
+  overlays no longer draw over them)
+
 ## [1.0.1] - 2026-10-15
 
 ### Added
