@@ -43,6 +43,21 @@ class MapScreenState extends State<MapScreen> {
   int _lastFingerprint = 0;
   double _lastDpi = -1;
 
+  // High-detail overlay: hi-res re-render of the visible region when
+  // zoomed in (keeps PDF text sharp like a native viewer).
+  static const _detailSrcPrefix = 'patok_src_detail_';
+  static const _detailLyrPrefix = 'patok_lyr_detail_';
+  final Set<String> _detailLayerIds = {};
+  final Set<String> _detailSourceIds = {};
+  int _detailGen = 0; // cancels stale in-flight detail renders
+  String _detailKey = ''; // page + quantized viewport + zoom bucket
+  // Base overlay bitmap width (px) and page top-edge width (meters),
+  // per page key: used to decide when the base is being upscaled.
+  final Map<String, int> _basePxWidth = {};
+  final Map<String, double> _baseMetersWidth = {};
+
+  String _pageKey(GeoMap m, GeoMapPage p) => '${m.id}_${p.pageIndex}';
+
   // Measure mode.
   bool _measureMode = false;
   final List<LatLng> _measurePoints = [];
@@ -53,6 +68,7 @@ class MapScreenState extends State<MapScreen> {
   Position? _lastGps;
 
   late final TrackRecorder _trackRecorder;
+  late final GnssService _gnssService;
 
   AppScope get _scope => AppScope.of(context);
 
@@ -62,7 +78,9 @@ class MapScreenState extends State<MapScreen> {
     _loadStyle();
     _startGps();
     _trackRecorder = AppScope.of(context).trackRecorder;
+    _gnssService = AppScope.of(context).gnssService;
     _trackRecorder.livePoints.addListener(_onTrackUpdate);
+    _gnssService.satellites.addListener(_onSatellitesChanged);
   }
 
   void _onTrackUpdate() {
@@ -73,6 +91,7 @@ class MapScreenState extends State<MapScreen> {
   void dispose() {
     _trackRecorder.livePoints.removeListener(_onTrackUpdate);
     _posSub?.cancel();
+    _gnssService.satellites.removeListener(_onSatellitesChanged);
     super.dispose();
   }
 
@@ -86,6 +105,7 @@ class MapScreenState extends State<MapScreen> {
     if (!ok) return;
     _posSub = _scope.locationService.positionStream().listen((p) {
       _lastGps = p;
+      _updateCoordReadout();
     });
   }
 
@@ -109,6 +129,10 @@ class MapScreenState extends State<MapScreen> {
     // Annotation layers must exist before raster overlays reference them
     // via belowLayerId (no-op when already ready).
     await _ensureAnnotationLayers();
+    // Base overlays changed: any detail render is stale.
+    await _clearDetailOverlay();
+    _basePxWidth.clear();
+    _baseMetersWidth.clear();
     // Remove old overlay layers/sources.
     for (final id in _layerIds) {
       try {
@@ -145,7 +169,7 @@ class MapScreenState extends State<MapScreen> {
         _busy = false;
         _status = failures > 0
             ? '$failures page(s) failed to render'
-                '${firstError != null ? ': $firstError' : ''}'
+                  '${firstError != null ? ': $firstError' : ''}'
             : null;
       });
     }
@@ -154,7 +178,10 @@ class MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _addOverlay(
-      MapLibreMapController c, GeoMap map, GeoMapPage page) async {
+    MapLibreMapController c,
+    GeoMap map,
+    GeoMapPage page,
+  ) async {
     final pdfPath = _scope.library.pdfPath(map);
     final overlay = await _scope.renderService.renderPage(
       pdfPath: pdfPath,
@@ -174,6 +201,16 @@ class MapScreenState extends State<MapScreen> {
     await _addPdfRasterLayer(c, sid, lid, map.opacity);
     _sourceIds.add(sid);
     _layerIds.add(lid);
+    // Remember the base bitmap size for the detail-zoom decision.
+    final key = _pageKey(map, page);
+    _basePxWidth[key] = overlay.width;
+    final tl = page.cornerLonLat[0], tr = page.cornerLonLat[1];
+    _baseMetersWidth[key] = Geolocator.distanceBetween(
+      tl[1],
+      tl[0],
+      tr[1],
+      tr[0],
+    );
   }
 
   /// Adds a PDF raster layer, always *below* the annotation stack so
@@ -193,7 +230,212 @@ class MapScreenState extends State<MapScreen> {
       await c.addRasterLayer(sid, lid, props);
     }
   }
+
   ///
+  /// Removes the high-detail overlay for one page (if present).
+  Future<void> _removeDetailForPage(GeoMap map, GeoMapPage page) async {
+    final c = _controller;
+    final sid = '$_detailSrcPrefix${map.id}_${page.pageIndex}';
+    final lid = '$_detailLyrPrefix${map.id}_${page.pageIndex}';
+    if (!_detailLayerIds.contains(lid) && !_detailSourceIds.contains(sid)) {
+      return;
+    }
+    _detailKey = ''; // force re-evaluation on next idle
+    if (c == null) return;
+    try {
+      await c.removeLayer(lid);
+    } catch (_) {}
+    try {
+      await c.removeSource(sid);
+    } catch (_) {}
+    _detailLayerIds.remove(lid);
+    _detailSourceIds.remove(sid);
+  }
+
+  /// Removes the high-detail overlay layers/sources (if any).
+  Future<void> _clearDetailOverlay() async {
+    final c = _controller;
+    _detailKey = '';
+    if (c == null) {
+      _detailLayerIds.clear();
+      _detailSourceIds.clear();
+      return;
+    }
+    for (final id in _detailLayerIds) {
+      try {
+        await c.removeLayer(id);
+      } catch (_) {}
+    }
+    for (final id in _detailSourceIds) {
+      try {
+        await c.removeSource(id);
+      } catch (_) {}
+    }
+    _detailLayerIds.clear();
+    _detailSourceIds.clear();
+  }
+
+  /// Re-renders the visible region at high detail when zoomed in past the
+  /// point where the base overlay starts upscaling (text would go blurry).
+  /// Runs on camera idle; stale renders are cancelled via [_detailGen].
+  Future<void> _maybeUpdateDetailOverlay() async {
+    final c = _controller;
+    if (c == null) return;
+    if (!_scope.settings.detailZoom) {
+      await _clearDetailOverlay();
+      return;
+    }
+    final gen = ++_detailGen;
+    try {
+      final region = await c.getVisibleRegion();
+      final camPos = c.cameraPosition;
+      if (gen != _detailGen || camPos == null) return;
+      final zoom = camPos.zoom;
+      final centerLat =
+          (region.northeast.latitude + region.southwest.latitude) / 2;
+      // Screen meters-per-pixel at this zoom/latitude.
+      final screenMpp =
+          156543.03 * math.cos(centerLat * math.pi / 180) / math.pow(2, zoom);
+
+      // Collect detail targets for visible pages whose base overlay is
+      // being upscaled.
+      final targets = <_DetailTarget>[];
+      for (final map in _scope.library.maps) {
+        if (!map.visible) continue;
+        for (final page in map.pages) {
+          final key = _pageKey(map, page);
+          final basePx = _basePxWidth[key];
+          final baseMeters = _baseMetersWidth[key];
+          if (basePx == null || baseMeters == null) continue;
+          final baseMpp = baseMeters / basePx;
+          // Base is sharp while the screen shows it at >= ~0.66x.
+          if (screenMpp >= baseMpp / 1.5) continue;
+          // Intersect the visible region with the page bbox.
+          final corners = page.cornerLonLat;
+          final lons = corners.map((p) => p[0]);
+          final lats = corners.map((p) => p[1]);
+          var minLon = math.max(
+            lons.reduce(math.min),
+            region.southwest.longitude,
+          );
+          var maxLon = math.min(
+            lons.reduce(math.max),
+            region.northeast.longitude,
+          );
+          var minLat = math.max(
+            lats.reduce(math.min),
+            region.southwest.latitude,
+          );
+          var maxLat = math.min(
+            lats.reduce(math.max),
+            region.northeast.latitude,
+          );
+          if (maxLon - minLon <= 0 || maxLat - minLat <= 0) continue;
+          // Margin so small pans don't immediately re-render.
+          final mLon = (maxLon - minLon) * 0.25;
+          final mLat = (maxLat - minLat) * 0.25;
+          minLon = math.max(lons.reduce(math.min), minLon - mLon);
+          maxLon = math.min(lons.reduce(math.max), maxLon + mLon);
+          minLat = math.max(lats.reduce(math.min), minLat - mLat);
+          maxLat = math.min(lats.reduce(math.max), maxLat + mLat);
+          // Target width: region in screen px, supersampled 1.5x.
+          final regionMeters = Geolocator.distanceBetween(
+            (minLat + maxLat) / 2,
+            minLon,
+            (minLat + maxLat) / 2,
+            maxLon,
+          );
+          final targetPx = (regionMeters / screenMpp * 1.5).clamp(
+            256.0,
+            2048.0,
+          );
+          targets.add(
+            _DetailTarget(
+              map: map,
+              page: page,
+              minLon: minLon,
+              minLat: minLat,
+              maxLon: maxLon,
+              maxLat: maxLat,
+              targetWidthPx: targetPx,
+            ),
+          );
+        }
+      }
+
+      if (targets.isEmpty) {
+        if (_detailLayerIds.isNotEmpty) await _clearDetailOverlay();
+        return;
+      }
+
+      // Quantized key: re-render only on meaningful viewport/zoom change.
+      final keyBuf = StringBuffer();
+      for (final t in targets) {
+        final q = (t.maxLon - t.minLon) / 8;
+        keyBuf.write(
+          '${t.map.id}_${t.page.pageIndex}_'
+          '${(t.minLon / q).round()}_${(t.minLat / q).round()}_'
+          '${(zoom * 2).round()};',
+        );
+      }
+      final newKey = keyBuf.toString();
+      if (newKey == _detailKey) return;
+
+      // Render each region (sequential; each is viewport-sized).
+      final rendered = <_DetailTarget, PageOverlay>{};
+      for (final t in targets) {
+        if (gen != _detailGen) return; // cancelled
+        try {
+          final overlay = await _scope.renderService.renderRegion(
+            pdfPath: _scope.library.pdfPath(t.map),
+            georef: t.page.georef,
+            minLon: t.minLon,
+            minLat: t.minLat,
+            maxLon: t.maxLon,
+            maxLat: t.maxLat,
+            targetWidthPx: t.targetWidthPx,
+          );
+          rendered[t] = overlay;
+        } catch (e) {
+          debugPrint('Patok: detail render failed: $e');
+        }
+      }
+      if (gen != _detailGen) return; // cancelled while rendering
+      if (!mounted) return;
+
+      // Swap in the new detail layers (below annotations, above base).
+      await _clearDetailOverlay();
+      for (final entry in rendered.entries) {
+        final t = entry.key;
+        final overlay = entry.value;
+        final sid = '$_detailSrcPrefix${t.map.id}_${t.page.pageIndex}';
+        final lid = '$_detailLyrPrefix${t.map.id}_${t.page.pageIndex}';
+        final quad = LatLngQuad(
+          topLeft: LatLng(overlay.corners[0].y, overlay.corners[0].x),
+          topRight: LatLng(overlay.corners[1].y, overlay.corners[1].x),
+          bottomRight: LatLng(overlay.corners[2].y, overlay.corners[2].x),
+          bottomLeft: LatLng(overlay.corners[3].y, overlay.corners[3].x),
+        );
+        try {
+          await c.addImageSource(sid, overlay.pngBytes, quad);
+          await c.addRasterLayer(
+            sid,
+            lid,
+            RasterLayerProperties(rasterOpacity: t.map.opacity),
+            belowLayerId: _lyrGrid,
+          );
+          _detailSourceIds.add(sid);
+          _detailLayerIds.add(lid);
+        } catch (e) {
+          debugPrint('Patok: detail layer failed: $e');
+        }
+      }
+      _detailKey = newKey;
+    } catch (e) {
+      debugPrint('Patok: detail overlay failed: $e');
+    }
+  }
+
   /// Guards the native map against out-of-range coordinates.
   ///
   /// When a PDF's coordinate system can't be resolved (e.g. a projected
@@ -217,10 +459,7 @@ class MapScreenState extends State<MapScreen> {
       maxLat = math.max(maxLat, lat);
     }
     final crs = page.georef.crsDescription ?? 'unknown';
-    if (minLon < -180 ||
-        maxLon > 180 ||
-        minLat < -90 ||
-        maxLat > 90) {
+    if (minLon < -180 || maxLon > 180 || minLat < -90 || maxLat > 90) {
       throw StateError(
         'Page "${page.name}" coordinates are outside the valid world range '
         '(lon ${minLon.toStringAsFixed(1)}…${maxLon.toStringAsFixed(1)}, '
@@ -286,6 +525,8 @@ class MapScreenState extends State<MapScreen> {
           await c.removeLayer(lid);
         } catch (_) {}
         _layerIds.remove(lid);
+        // The detail overlay belongs to this page: hide it too.
+        await _removeDetailForPage(map, page);
       } else if (map.visible && hasLayer) {
         // Opacity changed: re-add the layer with the new opacity.
         // The image source is untouched, so no re-render happens.
@@ -295,6 +536,16 @@ class MapScreenState extends State<MapScreen> {
         _layerIds.remove(lid);
         await _addPdfRasterLayer(c, sid, lid, map.opacity);
         _layerIds.add(lid);
+        // Keep the detail overlay at the same opacity.
+        final dlid = '$_detailLyrPrefix${map.id}_${page.pageIndex}';
+        if (_detailLayerIds.contains(dlid)) {
+          try {
+            await c.setLayerProperties(
+              dlid,
+              RasterLayerProperties(rasterOpacity: map.opacity),
+            );
+          } catch (_) {}
+        }
       }
     }
   }
@@ -320,6 +571,8 @@ class MapScreenState extends State<MapScreen> {
     }
     _updateCoordReadout();
     await _redrawAnnotations();
+    // Settings (e.g. the detail toggle) may have changed while away.
+    _maybeUpdateDetailOverlay();
   }
 
   /// Enters measure mode (idempotent; safe to call when already active).
@@ -390,41 +643,44 @@ class MapScreenState extends State<MapScreen> {
 
   bool _annLayersReady = false;
 
-  static Map<String, dynamic> _emptyFc() =>
-      {'type': 'FeatureCollection', 'features': []};
+  static Map<String, dynamic> _emptyFc() => {
+    'type': 'FeatureCollection',
+    'features': [],
+  };
 
   static Map<String, dynamic> _pointsFc(Iterable<List<double>> lonLat) => {
-        'type': 'FeatureCollection',
-        'features': [
-          for (final p in lonLat)
-            {
-              'type': 'Feature',
-              'geometry': {
-                'type': 'Point',
-                'coordinates': [p[0], p[1]],
-              },
-              'properties': {},
-            },
-        ],
-      };
+    'type': 'FeatureCollection',
+    'features': [
+      for (final p in lonLat)
+        {
+          'type': 'Feature',
+          'geometry': {
+            'type': 'Point',
+            'coordinates': [p[0], p[1]],
+          },
+          'properties': {},
+        },
+    ],
+  };
 
-  static Map<String, dynamic> _linesFc(Iterable<Iterable<List<double>>> lines) =>
-      {
-        'type': 'FeatureCollection',
-        'features': [
-          for (final line in lines)
-            {
-              'type': 'Feature',
-              'geometry': {
-                'type': 'LineString',
-                'coordinates': [
-                  for (final p in line) [p[0], p[1]],
-                ],
-              },
-              'properties': {},
-            },
-        ],
-      };
+  static Map<String, dynamic> _linesFc(
+    Iterable<Iterable<List<double>>> lines,
+  ) => {
+    'type': 'FeatureCollection',
+    'features': [
+      for (final line in lines)
+        {
+          'type': 'Feature',
+          'geometry': {
+            'type': 'LineString',
+            'coordinates': [
+              for (final p in line) [p[0], p[1]],
+            ],
+          },
+          'properties': {},
+        },
+    ],
+  };
 
   /// Creates the annotation sources/layers. Idempotent per style load;
   /// must run before any raster overlay is added with belowLayerId.
@@ -461,7 +717,10 @@ class MapScreenState extends State<MapScreen> {
         _srcGrid,
         _lyrGrid,
         const LineLayerProperties(
-            lineColor: '#9AA7B2', lineWidth: 1.0, lineOpacity: 0.45),
+          lineColor: '#9AA7B2',
+          lineWidth: 1.0,
+          lineOpacity: 0.45,
+        ),
       );
       await c.addGeoJsonSource(_srcMeasurements, _emptyFc());
       await c.addLineLayer(
@@ -485,20 +744,22 @@ class MapScreenState extends State<MapScreen> {
         _srcMeasure,
         _lyrMeasurePts,
         const CircleLayerProperties(
-            circleRadius: 7.0,
-            circleColor: '#FF6B1A',
-            circleStrokeWidth: 2.0,
-            circleStrokeColor: '#000000'),
+          circleRadius: 7.0,
+          circleColor: '#FF6B1A',
+          circleStrokeWidth: 2.0,
+          circleStrokeColor: '#000000',
+        ),
       );
       await c.addGeoJsonSource(_srcWaypoints, _emptyFc());
       await c.addCircleLayer(
         _srcWaypoints,
         _lyrWaypoints,
         const CircleLayerProperties(
-            circleRadius: 8.0,
-            circleColor: '#2196F3',
-            circleStrokeWidth: 2.0,
-            circleStrokeColor: '#FFFFFF'),
+          circleRadius: 8.0,
+          circleColor: '#2196F3',
+          circleStrokeWidth: 2.0,
+          circleStrokeColor: '#FFFFFF',
+        ),
       );
       _annLayersReady = true;
     } catch (e) {
@@ -516,8 +777,7 @@ class MapScreenState extends State<MapScreen> {
     try {
       // UTM grid.
       if (_scope.settings.showUtmGrid) {
-        await c.setGeoJsonSource(
-            _srcGrid, _linesFc(await _gridLineCoords(c)));
+        await c.setGeoJsonSource(_srcGrid, _linesFc(await _gridLineCoords(c)));
       } else {
         await c.setGeoJsonSource(_srcGrid, _emptyFc());
       }
@@ -525,7 +785,9 @@ class MapScreenState extends State<MapScreen> {
       // Saved measurements (green).
       final ms = await _scope.fieldData.measurements();
       await c.setGeoJsonSource(
-          _srcMeasurements, _linesFc(ms.map((m) => m.points)));
+        _srcMeasurements,
+        _linesFc(ms.map((m) => m.points)),
+      );
 
       // In-progress track recording (orange).
       final liveTrack = _trackRecorder.livePoints.value;
@@ -545,19 +807,13 @@ class MapScreenState extends State<MapScreen> {
             if (pts.length >= 2)
               {
                 'type': 'Feature',
-                'geometry': {
-                  'type': 'LineString',
-                  'coordinates': pts,
-                },
+                'geometry': {'type': 'LineString', 'coordinates': pts},
                 'properties': {},
               },
             for (final p in pts)
               {
                 'type': 'Feature',
-                'geometry': {
-                  'type': 'Point',
-                  'coordinates': p,
-                },
+                'geometry': {'type': 'Point', 'coordinates': p},
                 'properties': {},
               },
           ],
@@ -581,7 +837,8 @@ class MapScreenState extends State<MapScreen> {
   /// UTM grid line coordinates ([lon, lat] pairs) for the visible region.
   /// Line spacing follows zoom. Returns empty when the region is unknown.
   Future<List<List<List<double>>>> _gridLineCoords(
-      MapLibreMapController c) async {
+    MapLibreMapController c,
+  ) async {
     final pos = c.cameraPosition;
     if (pos == null) return [];
     final region = await c.getVisibleRegion();
@@ -589,12 +846,12 @@ class MapScreenState extends State<MapScreen> {
     final interval = zoom >= 15
         ? 500.0
         : zoom >= 13
-            ? 1000.0
-            : zoom >= 11
-                ? 2000.0
-                : zoom >= 9
-                    ? 5000.0
-                    : 10000.0;
+        ? 1000.0
+        : zoom >= 11
+        ? 2000.0
+        : zoom >= 9
+        ? 5000.0
+        : 10000.0;
     final centerLon =
         (region.northeast.longitude + region.southwest.longitude) / 2;
     final centerLat =
@@ -606,14 +863,14 @@ class MapScreenState extends State<MapScreen> {
     );
     math.Point<double> toUtm(double lon, double lat) {
       final p = proj4.Projection.WGS84.transform(
-          utm, proj4.Point(x: lon, y: lat));
+        utm,
+        proj4.Point(x: lon, y: lat),
+      );
       return math.Point(p.x, p.y);
     }
 
-    final sw =
-        toUtm(region.southwest.longitude, region.southwest.latitude);
-    final ne =
-        toUtm(region.northeast.longitude, region.northeast.latitude);
+    final sw = toUtm(region.southwest.longitude, region.southwest.latitude);
+    final ne = toUtm(region.northeast.longitude, region.northeast.latitude);
     final minE = math.min(sw.x, ne.x), maxE = math.max(sw.x, ne.x);
     final minN = math.min(sw.y, ne.y), maxN = math.max(sw.y, ne.y);
 
@@ -636,8 +893,10 @@ class MapScreenState extends State<MapScreen> {
           x = minE! + (maxE! - minE) * i / samples;
           y = northing!;
         }
-        final p =
-            utm.transform(proj4.Projection.WGS84, proj4.Point(x: x, y: y));
+        final p = utm.transform(
+          proj4.Projection.WGS84,
+          proj4.Point(x: x, y: y),
+        );
         pts.add([p.x, p.y]);
       }
       return pts;
@@ -695,17 +954,18 @@ class MapScreenState extends State<MapScreen> {
     if (_measurePoints.length < 2) return;
     final name = 'Measurement ${_measurePoints.length} pts';
     final ms = await _scope.fieldData.measurements();
-    ms.add(Measurement(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      name: name,
-      points: _measurePoints.map((p) => [p.longitude, p.latitude]).toList(),
-      lengthMeters: _measureLength,
-    ));
+    ms.add(
+      Measurement(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        name: name,
+        points: _measurePoints.map((p) => [p.longitude, p.latitude]).toList(),
+        lengthMeters: _measureLength,
+      ),
+    );
     await _scope.fieldData.saveMeasurements(ms);
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Measurement saved')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Measurement saved')));
     }
     _toggleMeasure();
   }
@@ -716,9 +976,8 @@ class MapScreenState extends State<MapScreen> {
     var pos = _lastGps ?? await _scope.locationService.currentPosition();
     if (pos == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No GPS fix yet')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('No GPS fix yet')));
       }
       return;
     }
@@ -729,14 +988,30 @@ class MapScreenState extends State<MapScreen> {
 
   // ----------------------------------------------------------- readout
 
+  void _onSatellitesChanged() {
+    if (mounted) setState(() {});
+  }
+
   void _updateCoordReadout() {
-    final target = _controller?.cameraPosition?.target;
-    if (target == null) return;
+    // Prefer the GPS position like dedicated field apps do; the map
+    // center is only a fallback before the first fix. (The plugin's
+    // cached cameraPosition can lag behind the actual camera, which
+    // once showed a stale default-Jakarta readout.)
+    final gps = _lastGps;
+    final double lon, lat;
+    if (gps != null) {
+      lon = gps.longitude;
+      lat = gps.latitude;
+    } else {
+      final target = _controller?.cameraPosition?.target;
+      if (target == null) return;
+      lon = target.longitude;
+      lat = target.latitude;
+    }
     final fmt = _scope.settings.coordFormat;
     final text = fmt == 'utm'
-        ? formatUtm(target.longitude, target.latitude)
-        : '${target.latitude.toStringAsFixed(5)}, '
-            '${target.longitude.toStringAsFixed(5)}';
+        ? formatUtm(lon, lat)
+        : '${lat.toStringAsFixed(5)}, ${lon.toStringAsFixed(5)}';
     if (mounted && text != _coordText) setState(() => _coordText = text);
   }
 
@@ -760,9 +1035,14 @@ class MapScreenState extends State<MapScreen> {
               onMapCreated: (c) => _controller = c,
               onStyleLoadedCallback: _onStyleLoaded,
               onMapClick: _onMapClick,
+              onCameraMove: (_) {
+                // Cancel any in-flight detail render: the viewport moved.
+                _detailGen++;
+              },
               onCameraIdle: () {
                 _updateCoordReadout();
                 _redrawAnnotations();
+                _maybeUpdateDetailOverlay();
               },
             )
           else
@@ -774,15 +1054,16 @@ class MapScreenState extends State<MapScreen> {
               child: Container(
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 12),
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: PatokTheme.surface.withValues(alpha: 0.92),
                   borderRadius: BorderRadius.circular(14),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.map,
-                        color: PatokTheme.accent, size: 20),
+                    const Icon(Icons.map, color: PatokTheme.accent, size: 20),
                     const SizedBox(width: 10),
                     Text(
                       _measureMode ? 'Measure: tap the map' : 'Patok',
@@ -813,8 +1094,11 @@ class MapScreenState extends State<MapScreen> {
                           bottomRight: Radius.circular(7),
                         ),
                       ),
-                      child: const Icon(Icons.map_outlined,
-                          color: PatokTheme.accent, size: 36),
+                      child: const Icon(
+                        Icons.map_outlined,
+                        color: PatokTheme.accent,
+                        size: 36,
+                      ),
                     ),
                     const SizedBox(height: 18),
                     Text(
@@ -860,9 +1144,7 @@ class MapScreenState extends State<MapScreen> {
                     const SizedBox(height: 10),
                     FloatingActionButton.small(
                       heroTag: 'measure',
-                      backgroundColor: _measureMode
-                          ? PatokTheme.accent
-                          : null,
+                      backgroundColor: _measureMode ? PatokTheme.accent : null,
                       onPressed: _toggleMeasure,
                       child: const Icon(Icons.straighten),
                     ),
@@ -890,8 +1172,10 @@ class MapScreenState extends State<MapScreen> {
                         onSave: _saveMeasurement,
                         onClose: _toggleMeasure,
                       )
-                    : _CoordBar(
-                        text: _coordText,
+                    : _GpsBar(
+                        coordText: _coordText,
+                        position: _lastGps,
+                        satellites: _gnssService.satellites.value,
                         busy: _busy,
                         status: _status,
                       ),
@@ -904,45 +1188,131 @@ class MapScreenState extends State<MapScreen> {
   }
 }
 
-class _CoordBar extends StatelessWidget {
-  const _CoordBar({required this.text, required this.busy, this.status});
-  final String text;
+class _GpsBar extends StatefulWidget {
+  const _GpsBar({
+    required this.coordText,
+    required this.position,
+    required this.satellites,
+    required this.busy,
+    this.status,
+  });
+  final String coordText;
+  final Position? position;
+  final (int, int)? satellites;
   final bool busy;
   final String? status;
 
   @override
+  State<_GpsBar> createState() => _GpsBarState();
+}
+
+class _GpsBarState extends State<_GpsBar> {
+  Timer? _ageTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Refresh the "fix age" label while the fix goes stale.
+    _ageTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted && widget.position != null) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ageTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final pos = widget.position;
+    final stats = <String>[];
+    if (pos != null) {
+      stats.add('ELEV ${pos.altitude.toStringAsFixed(0)}m');
+      final vAcc = pos.altitudeAccuracy;
+      final vTxt = pos.hasAltitudeAccuracy && vAcc.isFinite
+          ? ' V±${vAcc.toStringAsFixed(0)}m'
+          : '';
+      stats.add('H±${pos.accuracy.toStringAsFixed(0)}m$vTxt');
+      final sat = widget.satellites;
+      if (sat != null) stats.add('SAT ${sat.$1}/${sat.$2}');
+      final kmh = pos.speed * 3.6;
+      if (kmh.isFinite && kmh >= 0.5) stats.add('${kmh.toStringAsFixed(0)} km/h');
+      final age = DateTime.now().difference(pos.timestamp);
+      stats.add(_formatAge(age));
+    }
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
         color: PatokTheme.surface.withValues(alpha: 0.92),
         borderRadius: BorderRadius.circular(14),
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (busy)
-            const SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          else
-            const Icon(Icons.place,
-                color: PatokTheme.accent, size: 18),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              status ?? text,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+          Row(
+            children: [
+              if (widget.busy)
+                const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                const Icon(Icons.place, color: PatokTheme.accent, size: 18),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  widget.status ?? widget.coordText,
+                  style: textTheme.bodyMedium?.copyWith(
                     fontFamily: 'monospace',
                     fontFamilyFallback: const ['monospace'],
                   ),
-            ),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.copy, size: 18),
+                color: PatokTheme.onSurfaceDim,
+                tooltip: 'Copy coordinates',
+                constraints: const BoxConstraints(),
+                padding: EdgeInsets.zero,
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: widget.coordText));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Coordinates copied'),
+                      duration: Duration(seconds: 1),
+                    ),
+                  );
+                },
+              ),
+            ],
           ),
+          if (stats.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              stats.join('  ·  '),
+              style: textTheme.bodySmall?.copyWith(
+                color: PatokTheme.onSurfaceDim,
+                fontFamily: 'monospace',
+                fontFamilyFallback: const ['monospace'],
+              ),
+            ),
+          ],
         ],
       ),
     );
+  }
+
+  String _formatAge(Duration age) {
+    if (age.inSeconds < 10) return 'fix now';
+    if (age.inMinutes < 1) return 'fix ${age.inSeconds}s ago';
+    if (age.inHours < 1) return 'fix ${age.inMinutes}m ago';
+    return 'fix ${age.inHours}h ago';
   }
 }
 
@@ -980,15 +1350,18 @@ class _MeasurePanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              Text('Distance: $_formatted',
-                  style: Theme.of(context).textTheme.titleMedium),
+              Text(
+                'Distance: $_formatted',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
               const Spacer(),
-              IconButton(
-                  onPressed: onClose, icon: const Icon(Icons.close)),
+              IconButton(onPressed: onClose, icon: const Icon(Icons.close)),
             ],
           ),
-          Text('$pointCount point(s) — tap map to add',
-              style: Theme.of(context).textTheme.bodySmall),
+          Text(
+            '$pointCount point(s) — tap map to add',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -1092,10 +1465,12 @@ class _LayersSheetState extends State<_LayersSheet> {
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      Text(m.name,
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .titleMedium),
+                                      Text(
+                                        m.name,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .titleMedium,
+                                      ),
                                       Text(
                                         '${m.pages.length} page(s) georeferenced',
                                         style: Theme.of(context)
@@ -1121,9 +1496,11 @@ class _LayersSheetState extends State<_LayersSheet> {
                             ),
                             Row(
                               children: [
-                                const Icon(Icons.opacity,
-                                    size: 18,
-                                    color: PatokTheme.onSurfaceDim),
+                                const Icon(
+                                  Icons.opacity,
+                                  size: 18,
+                                  color: PatokTheme.onSurfaceDim,
+                                ),
                                 Expanded(
                                   child: Slider(
                                     value: m.opacity,
@@ -1137,8 +1514,9 @@ class _LayersSheetState extends State<_LayersSheet> {
                                   width: 48,
                                   child: Text(
                                     '${(m.opacity * 100).round()}%',
-                                    style:
-                                        Theme.of(context).textTheme.bodySmall,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall,
                                   ),
                                 ),
                               ],
@@ -1155,4 +1533,25 @@ class _LayersSheetState extends State<_LayersSheet> {
       ),
     );
   }
+}
+
+/// A high-detail re-render request for one visible page region.
+class _DetailTarget {
+  _DetailTarget({
+    required this.map,
+    required this.page,
+    required this.minLon,
+    required this.minLat,
+    required this.maxLon,
+    required this.maxLat,
+    required this.targetWidthPx,
+  });
+
+  final GeoMap map;
+  final GeoMapPage page;
+  final double minLon;
+  final double minLat;
+  final double maxLon;
+  final double maxLat;
+  final double targetWidthPx;
 }
