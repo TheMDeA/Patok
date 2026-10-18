@@ -1,9 +1,15 @@
 # Patok v1.0.2
 
-Redesigned navigation following the approved mockup — plus import and
-rendering fixes.
+Sharper maps when zoomed in, a proper GPS status bar, and navigation
+redesigned following the approved mockup — plus import and rendering fixes.
 
 ## What's new
+- Sharp text when zoomed in: map detail re-renders at screen resolution
+  (toggle in Settings)
+- GPS status bar: elevation, horizontal/vertical accuracy, live satellite
+  count, speed, and fix age under the coordinates, with a copy button
+- Bottom coordinate bar now shows your GPS position instead of the map
+  center
 - Bottom navigation (Map | Library | Field); the app now opens on the
   Library instead of the map
 - Map library redesigned: search, "Bring your own map" import card,
@@ -15,9 +21,5 @@ rendering fixes.
 - Imported maps now land in the right place and orientation, and the
   camera zooms to a map right after import
 - Zoom-adaptive UTM grid toggle in the Layers sheet
-- Sharp text when zoomed in: map detail re-renders at screen resolution
-  (toggle in Settings)
-- GPS status bar: elevation, horizontal/vertical accuracy, live satellite
-  count, speed, and fix age under the coordinates, with a copy button
 - Sunlight mode applies immediately, no restart needed
 - Toggling layer visibility/opacity no longer re-renders the map
