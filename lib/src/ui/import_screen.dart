@@ -5,8 +5,14 @@ import '../models.dart';
 
 /// Import flow: pick a PDF -> parse with progress -> show georeferenced
 /// pages -> add to the map.
+///
+/// When [sharedPath] is provided (a PDF shared from another app), the file
+/// picker is skipped and that file is imported directly.
 class ImportScreen extends StatefulWidget {
-  const ImportScreen({super.key});
+  const ImportScreen({super.key, this.sharedPath});
+
+  /// Absolute path of a pre-shared PDF, or null to show the file picker.
+  final String? sharedPath;
 
   @override
   State<ImportScreen> createState() => _ImportScreenState();
@@ -28,14 +34,19 @@ class _ImportScreenState extends State<ImportScreen> {
     setState(() {
       _error = null;
       _result = null;
-      _progress = 'Opening file picker…';
+      _progress = widget.sharedPath == null
+          ? 'Opening file picker…'
+          : 'Reading shared file…';
     });
     try {
-      final map = await AppScope.of(context)
-          .importService
-          .importWithPicker((msg) {
-        if (mounted) setState(() => _progress = msg);
-      });
+      final svc = AppScope.of(context).importService;
+      final GeoMap? map = widget.sharedPath == null
+          ? await svc.importWithPicker((msg) {
+              if (mounted) setState(() => _progress = msg);
+            })
+          : await svc.importFile(widget.sharedPath!, (msg) {
+              if (mounted) setState(() => _progress = msg);
+            });
       if (map == null) {
         // User cancelled the picker.
         if (mounted) Navigator.pop(context);

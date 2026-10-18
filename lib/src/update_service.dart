@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
@@ -134,25 +135,48 @@ Future<bool> isApkCached(String version) async =>
 /// Streams the APK into the cache with progress, writing to a `.part` file
 /// first and renaming on completion so a partial download is never mistaken
 /// for a finished one.
+///
+/// Resumes from an existing `.part` file via the HTTP `Range` header, so a
+/// dropped connection on weak signal doesn't restart a 50+ MB download
+/// from zero. Falls back to a fresh download when the server ignores the
+/// range request.
 Future<void> downloadApk(
   String apkUrl,
   String version, {
   required void Function(DownloadProgress progress) onProgress,
+  @visibleForTesting http.Client? client,
 }) async {
-  final client = http.Client();
+  final owned = client == null;
+  client ??= http.Client();
   try {
-    final req = http.Request('GET', Uri.parse(apkUrl));
-    req.headers['User-Agent'] = 'Patok';
-    final res = await client.send(req).timeout(const Duration(seconds: 30));
-    if (res.statusCode != 200) {
-      throw HttpException('Download returned ${res.statusCode}');
-    }
-    final total = res.contentLength ?? -1;
     final file = await _apkFile(version);
     final part = File('${file.path}.part');
-    var received = 0;
+    var resumeFrom = await part.exists() ? await part.length() : 0;
+
+    http.StreamedResponse res = await _sendDownload(client, apkUrl,
+        resumeFrom: resumeFrom);
+
+    if (res.statusCode == 416 && resumeFrom > 0) {
+      // Range not satisfiable (stale part file): start over once.
+      await part.delete();
+      resumeFrom = 0;
+      res = await _sendDownload(client, apkUrl, resumeFrom: 0);
+    }
+
+    final bool resumed = res.statusCode == 206 && resumeFrom > 0;
+    if (res.statusCode != 200 && !resumed) {
+      throw HttpException('Download returned ${res.statusCode}');
+    }
+    if (!resumed && resumeFrom > 0) {
+      // Server ignored the Range header: discard the partial file.
+      await part.delete();
+      resumeFrom = 0;
+    }
+
+    final total = _totalFrom(res, resumeFrom);
+    var received = resumeFrom;
     final sw = Stopwatch()..start();
-    final sink = part.openWrite();
+    final sink = part.openWrite(mode: resumed ? FileMode.append : FileMode.write);
     try {
       await for (final chunk in res.stream) {
         sink.add(chunk);
@@ -168,8 +192,34 @@ Future<void> downloadApk(
     }
     await part.rename(file.path);
   } finally {
-    client.close();
+    if (owned) client.close();
   }
+}
+
+Future<http.StreamedResponse> _sendDownload(
+  http.Client client,
+  String apkUrl, {
+  required int resumeFrom,
+}) async {
+  final req = http.Request('GET', Uri.parse(apkUrl));
+  req.headers['User-Agent'] = 'Patok';
+  if (resumeFrom > 0) req.headers['Range'] = 'bytes=$resumeFrom-';
+  return client.send(req).timeout(const Duration(seconds: 30));
+}
+
+/// Total download size, accounting for a resumed range response
+/// (`Content-Range: bytes 100-999/5000`).
+int _totalFrom(http.StreamedResponse res, int resumeFrom) {
+  final contentRange = res.headers['content-range'];
+  if (contentRange != null) {
+    final slash = contentRange.lastIndexOf('/');
+    if (slash >= 0) {
+      final total = int.tryParse(contentRange.substring(slash + 1));
+      if (total != null) return total;
+    }
+  }
+  final len = res.contentLength ?? -1;
+  return len > 0 && resumeFrom > 0 ? len + resumeFrom : len;
 }
 
 /// Hands the downloaded APK to Android's installer via the `patok/update`

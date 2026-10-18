@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import 'app_scope.dart';
@@ -83,6 +85,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
     if (ok == true) {
       await scope.library.remove(m);
+      await scope.thumbnailService.deleteThumbnail(m.id);
       if (mounted) setState(() {});
     }
   }
@@ -272,6 +275,43 @@ class _FilterChip extends StatelessWidget {
   }
 }
 
+/// Library card thumbnail: the map's first page rendered small, cached on
+/// disk. Falls back to the map icon while loading or when unavailable.
+class _Thumbnail extends StatelessWidget {
+  const _Thumbnail({required this.map});
+  final GeoMap map;
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<File?>(
+      future: AppScope.of(context).thumbnailService.ensureThumbnail(map),
+      builder: (context, snap) {
+        final file = snap.data;
+        if (file == null) {
+          return Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              color: PatokTheme.accent.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Icon(Icons.map, color: PatokTheme.accent),
+          );
+        }
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Image.file(
+            file,
+            width: 64,
+            height: 64,
+            fit: BoxFit.cover,
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _MapCard extends StatelessWidget {
   const _MapCard({
     required this.map,
@@ -296,15 +336,7 @@ class _MapCard extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           child: Row(
             children: [
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: PatokTheme.accent.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(Icons.map, color: PatokTheme.accent),
-              ),
+              _Thumbnail(map: map),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
