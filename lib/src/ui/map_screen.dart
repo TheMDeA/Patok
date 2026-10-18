@@ -292,14 +292,12 @@ class MapScreenState extends State<MapScreen> {
     final gen = ++_detailGen;
     try {
       final region = await c.getVisibleRegion();
-      final camPos = c.cameraPosition;
-      if (gen != _detailGen || camPos == null) return;
-      final zoom = camPos.zoom;
-      final centerLat =
-          (region.northeast.latitude + region.southwest.latitude) / 2;
-      // Screen meters-per-pixel at this zoom/latitude.
-      final screenMpp =
-          156543.03 * math.cos(centerLat * math.pi / 180) / math.pow(2, zoom);
+      if (gen != _detailGen) return;
+      // Screen meters-per-pixel from the live region — never from the
+      // plugin's cached camera position (can go stale; see
+      // _metersPerPixel).
+      final screenMpp = _metersPerPixel(region);
+      if (screenMpp <= 0) return;
 
       // Collect detail targets for visible pages whose base overlay is
       // being upscaled.
@@ -373,13 +371,16 @@ class MapScreenState extends State<MapScreen> {
       }
 
       // Quantized key: re-render only on meaningful viewport/zoom change.
+      // (Zoom bucket derived from mpp: half-zoom steps like before.)
+      final zoomBucket =
+          (math.log(1 / screenMpp) / math.ln2 * 2).round();
       final keyBuf = StringBuffer();
       for (final t in targets) {
         final q = (t.maxLon - t.minLon) / 8;
         keyBuf.write(
           '${t.map.id}_${t.page.pageIndex}_'
           '${(t.minLon / q).round()}_${(t.minLat / q).round()}_'
-          '${(zoom * 2).round()};',
+          '$zoomBucket;',
         );
       }
       final newKey = keyBuf.toString();
@@ -863,21 +864,29 @@ class MapScreenState extends State<MapScreen> {
   }
 
   /// UTM grid line coordinates ([lon, lat] pairs) for the visible region.
-  /// Line spacing follows zoom. Returns empty when the region is unknown.
+  /// Line spacing follows the visible width. Returns empty when the region
+  /// is unknown.
   Future<List<List<List<double>>>> _gridLineCoords(
     MapLibreMapController c,
   ) async {
-    final pos = c.cameraPosition;
-    if (pos == null) return [];
     final region = await c.getVisibleRegion();
-    final zoom = pos.zoom;
-    final interval = zoom >= 15
+    final midLat =
+        (region.northeast.latitude + region.southwest.latitude) / 2;
+    // Visible width in meters (replaces the old zoom-based tiers — the
+    // plugin's cached zoom can go stale).
+    final widthMeters = Geolocator.distanceBetween(
+      midLat,
+      region.southwest.longitude,
+      midLat,
+      region.northeast.longitude,
+    );
+    final interval = widthMeters < 8000
         ? 500.0
-        : zoom >= 13
+        : widthMeters < 30000
         ? 1000.0
-        : zoom >= 11
+        : widthMeters < 120000
         ? 2000.0
-        : zoom >= 9
+        : widthMeters < 500000
         ? 5000.0
         : 10000.0;
     final centerLon =
@@ -1028,11 +1037,36 @@ class MapScreenState extends State<MapScreen> {
     if (mounted) setState(() {});
   }
 
-  void _updateMetersPerPx(CameraPosition cam) {
-    final mpp = 156543.03392 *
-        math.cos(cam.target.latitude * math.pi / 180) /
-        math.pow(2, cam.zoom);
-    _metersPerPx.value = mpp;
+  /// Meters per screen pixel derived from the *visible region* (fresh
+  /// method-channel data), never from `controller.cameraPosition` — the
+  /// plugin's cached position can go stale (non-finite native values are
+  /// never cached), which once froze the scale bar at "200 km" and kept
+  /// the detail zoom from ever engaging.
+  double _metersPerPixel(LatLngBounds region) {
+    final midLat =
+        (region.northeast.latitude + region.southwest.latitude) / 2;
+    final meters = Geolocator.distanceBetween(
+      midLat,
+      region.southwest.longitude,
+      midLat,
+      region.northeast.longitude,
+    );
+    final widthPx = MediaQuery.of(context).size.width *
+        MediaQuery.of(context).devicePixelRatio;
+    if (meters <= 0 || widthPx <= 0) return 0;
+    return meters / widthPx;
+  }
+
+  DateTime _lastMppRefresh = DateTime.fromMillisecondsSinceEpoch(0);
+
+  Future<void> _refreshMetersPerPx() async {
+    final c = _controller;
+    if (c == null || !mounted) return;
+    try {
+      final region = await c.getVisibleRegion();
+      final mpp = _metersPerPixel(region);
+      if (mpp > 0) _metersPerPx.value = mpp;
+    } catch (_) {}
   }
 
   void _updateCoordReadout() {
@@ -1078,14 +1112,18 @@ class MapScreenState extends State<MapScreen> {
               onMapCreated: (c) => _controller = c,
               onStyleLoadedCallback: _onStyleLoaded,
               onMapClick: _onMapClick,
-              onCameraMove: (cam) {
+              onCameraMove: (_) {
                 // Cancel any in-flight detail render: the viewport moved.
                 _detailGen++;
-                _updateMetersPerPx(cam);
+                // Throttled scale-bar refresh from the live region.
+                final now = DateTime.now();
+                if (now.difference(_lastMppRefresh).inMilliseconds > 400) {
+                  _lastMppRefresh = now;
+                  _refreshMetersPerPx();
+                }
               },
               onCameraIdle: () {
-                final cam = _controller?.cameraPosition;
-                if (cam != null) _updateMetersPerPx(cam);
+                _refreshMetersPerPx();
                 _updateCoordReadout();
                 _redrawAnnotations();
                 _maybeUpdateDetailOverlay();
@@ -1352,7 +1390,9 @@ class _GpsBarState extends State<_GpsBar> {
           if (stats.isNotEmpty) ...[
             const SizedBox(height: 4),
             Text(
-              stats.join('  ·  '),
+              stats.join(' · '),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: textTheme.bodySmall?.copyWith(
                 color: PatokTheme.onSurfaceDim,
                 fontFamily: 'monospace',
@@ -1366,10 +1406,10 @@ class _GpsBarState extends State<_GpsBar> {
   }
 
   String _formatAge(Duration age) {
-    if (age.inSeconds < 10) return 'fix now';
-    if (age.inMinutes < 1) return 'fix ${age.inSeconds}s ago';
-    if (age.inHours < 1) return 'fix ${age.inMinutes}m ago';
-    return 'fix ${age.inHours}h ago';
+    if (age.inSeconds < 10) return 'now';
+    if (age.inMinutes < 1) return '${age.inSeconds}s ago';
+    if (age.inHours < 1) return '${age.inMinutes}m ago';
+    return '${age.inHours}h ago';
   }
 }
 

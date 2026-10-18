@@ -5,6 +5,16 @@ and concise.
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-10-18
+
+### Fixed
+- Sharp detail rendering now actually engages when zoomed in (it was
+  reading a frozen camera position and never triggered)
+- Scale bar shows the correct distance (it could read "200 km" while
+  zoomed into a mine pit)
+- UTM grid spacing follows the actual visible area
+- GPS status details stay on a single line
+
 ## [1.0.2] - 2026-10-18
 
 ### Added
