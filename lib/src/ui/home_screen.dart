@@ -1,9 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import '../models.dart';
 import '../theme.dart';
 import '../update_service.dart';
 import 'field_screen.dart';
+import 'import_screen.dart';
 import 'library_screen.dart';
 import 'map_screen.dart';
 import 'update_sheet.dart';
@@ -45,6 +49,43 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
     });
+    // "Open with Patok": a PDF shared from another app (cold start).
+    final rsi = ReceiveSharingIntent.instance;
+    rsi.getInitialMedia().then((files) {
+      if (files.isNotEmpty && mounted) _importShared(files.first.path);
+      rsi.reset();
+    });
+    // Same, while the app is already running.
+    _shareSub = rsi.getMediaStream().listen((files) {
+      if (files.isNotEmpty && mounted) _importShared(files.first.path);
+    });
+  }
+
+  StreamSubscription<List<SharedMediaFile>>? _shareSub;
+
+  /// Imports a PDF shared from another app, then opens it on the map.
+  Future<void> _importShared(String path) async {
+    if (!path.toLowerCase().endsWith('.pdf')) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('Patok can only open PDF files')),
+        );
+      }
+      return;
+    }
+    final map = await Navigator.push<GeoMap>(
+      context,
+      MaterialPageRoute(
+          builder: (_) => ImportScreen(sharedPath: path)),
+    );
+    if (map != null && mounted) _openMap(map);
+  }
+
+  @override
+  void dispose() {
+    _shareSub?.cancel();
+    super.dispose();
   }
 
   void _openMap(GeoMap map) {

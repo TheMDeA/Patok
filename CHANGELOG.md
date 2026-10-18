@@ -7,6 +7,11 @@ and concise.
 
 ## [1.0.3] - 2026-10-18
 
+### Added
+- "Open with Patok": import a PDF shared from another app (e.g. WhatsApp)
+  straight into the library
+- Library cards now show a thumbnail preview of each map
+
 ### Fixed
 - Sharp detail rendering now actually engages when zoomed in (it was
   reading a frozen camera position and never triggered)
@@ -14,6 +19,8 @@ and concise.
   zoomed into a mine pit)
 - UTM grid spacing follows the actual visible area
 - GPS status details stay on a single line
+- Update downloads resume after a dropped connection instead of
+  restarting from zero
 
 ## [1.0.2] - 2026-10-18
 

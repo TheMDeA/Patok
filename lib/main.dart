@@ -12,6 +12,7 @@ Future<void> main() async {
   final library = await MapLibrary.load();
   final renderService = RenderService();
   final importService = ImportService(library, renderService);
+  final thumbnailService = ThumbnailService(renderService);
   final locationService = LocationService();
   final gnssService = GnssService()..start();
   final trackRecorder = TrackRecorder(locationService);
@@ -25,6 +26,7 @@ Future<void> main() async {
       library: library,
       renderService: renderService,
       importService: importService,
+      thumbnailService: thumbnailService,
       locationService: locationService,
       gnssService: gnssService,
       trackRecorder: trackRecorder,

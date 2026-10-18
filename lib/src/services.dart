@@ -119,6 +119,31 @@ class RenderService {
     required String pdfPath,
     required PageGeoref georef,
     double dpi = 150,
+  }) =>
+      _render(pdfPath: pdfPath, georef: georef, dpi: dpi, maxEdge: 2048);
+
+  /// Renders a small preview of the page for library thumbnails.
+  /// The long edge is capped at [maxEdge] px; no georef corners are
+  /// returned (null), only the PNG bytes matter.
+  Future<Uint8List> renderThumbnail({
+    required String pdfPath,
+    required PageGeoref georef,
+    double maxEdge = 320,
+  }) async {
+    final overlay = await _render(
+      pdfPath: pdfPath,
+      georef: georef,
+      dpi: 150,
+      maxEdge: maxEdge,
+    );
+    return overlay.pngBytes;
+  }
+
+  Future<PageOverlay> _render({
+    required String pdfPath,
+    required PageGeoref georef,
+    required double dpi,
+    required double maxEdge,
   }) async {
     final doc = await PdfDocument.openFile(pdfPath);
     try {
@@ -132,7 +157,6 @@ class RenderService {
         wPx = hPx;
         hPx = t;
       }
-      const maxEdge = 2048;
       // Cap well below the GL texture limit: a 2048px RGBA image is ~17MB,
       // while 4096px (67MB) plus PNG-encode working buffers reliably
       // OOM-kills the app on real devices. Tiling (v2) removes the cap.
@@ -487,7 +511,59 @@ class ImportService {
     );
     onProgress('Saving to library…');
     await _library.add(map);
+    // Best-effort library thumbnail; a failure here never fails the import.
+    try {
+      final png = await _render.renderThumbnail(
+        pdfPath: dest.path,
+        georef: pages.first.georef,
+      );
+      final thumb = File('${dir.path}/thumbs/$id.png');
+      await thumb.parent.create(recursive: true);
+      await thumb.writeAsBytes(png);
+    } catch (_) {}
     return map;
+  }
+}
+
+/// Small page previews for library cards, cached on disk under
+/// `<appDir>/thumbs/<mapId>.png`.
+class ThumbnailService {
+  ThumbnailService(this._render);
+  final RenderService _render;
+
+  Future<File> _thumbFile(String mapId) async {
+    final dir = await _appDir();
+    return File('${dir.path}/thumbs/$mapId.png');
+  }
+
+  /// Returns the cached thumbnail, generating it on first use (backfill
+  /// for maps imported before thumbnails existed). Returns null when the
+  /// map has no pages or rendering fails — callers fall back to an icon.
+  Future<File?> ensureThumbnail(GeoMap map) async {
+    try {
+      final file = await _thumbFile(map.id);
+      if (await file.exists()) return file;
+      if (map.pages.isEmpty) return null;
+      final dir = await _appDir();
+      final pdf = File('${dir.path}/${map.relativePdfPath}');
+      if (!await pdf.exists()) return null;
+      final png = await _render.renderThumbnail(
+        pdfPath: pdf.path,
+        georef: map.pages.first.georef,
+      );
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(png);
+      return file;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> deleteThumbnail(String mapId) async {
+    try {
+      final file = await _thumbFile(mapId);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
   }
 }
 

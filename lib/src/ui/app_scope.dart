@@ -9,6 +9,7 @@ class AppScope extends InheritedWidget {
     required this.library,
     required this.renderService,
     required this.importService,
+    required this.thumbnailService,
     required this.locationService,
     required this.gnssService,
     required this.trackRecorder,
@@ -20,6 +21,7 @@ class AppScope extends InheritedWidget {
   final MapLibrary library;
   final RenderService renderService;
   final ImportService importService;
+  final ThumbnailService thumbnailService;
   final LocationService locationService;
   final GnssService gnssService;
   final TrackRecorder trackRecorder;
