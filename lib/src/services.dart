@@ -110,6 +110,47 @@ class PageOverlay {
 
 /// Renders PDF pages to PNG overlays positioned in WGS84.
 class RenderService {
+  // Open documents, cached by path: re-parsing the xref on every render
+  // was the dominant cost of the detail overlay. Insertion-ordered for
+  // LRU eviction; a doc is only evicted (disposed) when no render is
+  // using it, so parallel renders of different PDFs are safe.
+  final Map<String, PdfDocument> _docCache = {};
+  final Map<String, int> _docRefs = {};
+  static const _maxCachedDocs = 3;
+
+  Future<PdfDocument> _openDoc(String pdfPath) async {
+    final hit = _docCache[pdfPath];
+    if (hit != null) {
+      _docRefs[pdfPath] = (_docRefs[pdfPath] ?? 0) + 1;
+      // Refresh MRU position (Dart maps are insertion-ordered).
+      _docCache.remove(pdfPath);
+      _docCache[pdfPath] = hit;
+      return hit;
+    }
+    final doc = await PdfDocument.openFile(pdfPath);
+    _docCache[pdfPath] = doc;
+    _docRefs[pdfPath] = 1;
+    while (_docCache.length > _maxCachedDocs) {
+      final victim = _docCache.keys.firstWhere(
+        (k) => (_docRefs[k] ?? 0) == 0,
+        orElse: () => '',
+      );
+      if (victim.isEmpty) break; // all in use; keep them for now
+      await _docCache.remove(victim)?.dispose();
+      _docRefs.remove(victim);
+    }
+    return doc;
+  }
+
+  void _releaseDoc(String pdfPath) {
+    final n = (_docRefs[pdfPath] ?? 0) - 1;
+    if (n <= 0) {
+      _docRefs.remove(pdfPath);
+    } else {
+      _docRefs[pdfPath] = n;
+    }
+  }
+
   /// Renders [pageIndex] of the PDF at [pdfPath] at [dpi], returning the
   /// PNG bytes plus the WGS84 corner coordinates for a map image source.
   ///
@@ -145,7 +186,7 @@ class RenderService {
     required double dpi,
     required double maxEdge,
   }) async {
-    final doc = await PdfDocument.openFile(pdfPath);
+    final doc = await _openDoc(pdfPath);
     try {
       final page = doc.pages[georef.pageIndex];
       var wPx = (georef.pageWidthPt * dpi / 72).round();
@@ -196,7 +237,7 @@ class RenderService {
         image.dispose();
       }
     } finally {
-      await doc.dispose();
+      _releaseDoc(pdfPath);
     }
   }
 
@@ -216,7 +257,7 @@ class RenderService {
     required double maxLat,
     required double targetWidthPx,
   }) async {
-    final doc = await PdfDocument.openFile(pdfPath);
+    final doc = await _openDoc(pdfPath);
     try {
       final page = doc.pages[georef.pageIndex];
       // 1. lon/lat bbox -> PDF user space (points), via inverse projection
@@ -358,7 +399,7 @@ class RenderService {
         image.dispose();
       }
     } finally {
-      await doc.dispose();
+      _releaseDoc(pdfPath);
     }
   }
 

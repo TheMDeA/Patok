@@ -50,6 +50,7 @@ class MapScreenState extends State<MapScreen> {
   final Set<String> _detailLayerIds = {};
   final Set<String> _detailSourceIds = {};
   int _detailGen = 0; // cancels stale in-flight detail renders
+  Timer? _detailDebounce; // settle-debounce for detail renders
   String _detailKey = ''; // page + quantized viewport + zoom bucket
   // Base overlay bitmap width (px) and page top-edge width (meters),
   // per page key: used to decide when the base is being upscaled.
@@ -96,6 +97,7 @@ class MapScreenState extends State<MapScreen> {
     _posSub?.cancel();
     _gnssService.satellites.removeListener(_onSatellitesChanged);
     _metersPerPx.dispose();
+    _detailDebounce?.cancel();
     super.dispose();
   }
 
@@ -386,25 +388,31 @@ class MapScreenState extends State<MapScreen> {
       final newKey = keyBuf.toString();
       if (newKey == _detailKey) return;
 
-      // Render each region (sequential; each is viewport-sized).
-      final rendered = <_DetailTarget, PageOverlay>{};
-      for (final t in targets) {
-        if (gen != _detailGen) return; // cancelled
-        try {
-          final overlay = await _scope.renderService.renderRegion(
-            pdfPath: _scope.library.pdfPath(t.map),
-            georef: t.page.georef,
-            minLon: t.minLon,
-            minLat: t.minLat,
-            maxLon: t.maxLon,
-            maxLat: t.maxLat,
-            targetWidthPx: t.targetWidthPx,
-          );
-          rendered[t] = overlay;
-        } catch (e) {
-          debugPrint('Patok: detail render failed: $e');
-        }
-      }
+      // Render regions in parallel (each is viewport-sized); the shared
+      // document cache keeps this from re-parsing the PDF per region.
+      final results = await Future.wait(
+        targets.map((t) async {
+          try {
+            final overlay = await _scope.renderService.renderRegion(
+              pdfPath: _scope.library.pdfPath(t.map),
+              georef: t.page.georef,
+              minLon: t.minLon,
+              minLat: t.minLat,
+              maxLon: t.maxLon,
+              maxLat: t.maxLat,
+              targetWidthPx: t.targetWidthPx,
+            );
+            return MapEntry(t, overlay);
+          } catch (e) {
+            debugPrint('Patok: detail render failed: $e');
+            return null;
+          }
+        }),
+      );
+      final rendered = <_DetailTarget, PageOverlay>{
+        for (final e in results)
+          if (e != null) e.key: e.value,
+      };
       if (gen != _detailGen) return; // cancelled while rendering
       if (!mounted) return;
 
@@ -1126,7 +1134,13 @@ class MapScreenState extends State<MapScreen> {
                 _refreshMetersPerPx();
                 _updateCoordReadout();
                 _redrawAnnotations();
-                _maybeUpdateDetailOverlay();
+                // Settle-debounce: a quick second gesture would cancel an
+                // in-flight render anyway, so wait briefly and render once.
+                _detailDebounce?.cancel();
+                _detailDebounce = Timer(
+                  const Duration(milliseconds: 250),
+                  _maybeUpdateDetailOverlay,
+                );
               },
             )
           else

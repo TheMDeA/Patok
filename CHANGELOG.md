@@ -5,6 +5,12 @@ and concise.
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-10-18
+
+### Fixed
+- Detail rendering is faster: the PDF stays open between renders, pages
+  render in parallel, and rapid pans settle before re-rendering
+
 ## [1.0.3] - 2026-10-18
 
 ### Added
