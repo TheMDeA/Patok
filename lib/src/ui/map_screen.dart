@@ -614,6 +614,12 @@ class MapScreenState extends State<MapScreen> {
       imp.visible = true;
       await _scope.library.save();
     }
+    // The map may still be initializing on first visit: wait briefly for
+    // the controller + annotation stack instead of silently no-opping.
+    for (var i = 0; i < 50; i++) {
+      if (_controller != null && _annLayersReady) break;
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
     await _refreshDxfOverlays();
     await _zoomToDxf(imp);
   }
@@ -983,14 +989,15 @@ class MapScreenState extends State<MapScreen> {
   // DXF layers sit below the annotation stack (above PDF rasters) so
   // waypoints/measurements/track stay on top.
 
-  static String _dxfSourceId(String id) => 'patok_src_dxf_$id';
-  static String _dxfFillId(String id, int ci) =>
-      'patok_lyr_dxf_${id}_fill_$ci';
-  static String _dxfLineId(String id, int ci) =>
-      'patok_lyr_dxf_${id}_line_$ci';
-  static String _dxfPointId(String id, int ci) =>
-      'patok_lyr_dxf_${id}_pt_$ci';
-  static String _dxfLabelId(String id) => 'patok_lyr_dxf_${id}_label';
+  static String _dxfSourceId(String id, int ci) => 'patok_src_dxf_${id}_$ci';
+  static String _dxfFillId(String id, int ci, int li) =>
+      'patok_lyr_dxf_${id}_${ci}_fill_$li';
+  static String _dxfLineId(String id, int ci, int li) =>
+      'patok_lyr_dxf_${id}_${ci}_line_$li';
+  static String _dxfPointId(String id, int ci, int li) =>
+      'patok_lyr_dxf_${id}_${ci}_pt_$li';
+  static String _dxfLabelId(String id, int ci) =>
+      'patok_lyr_dxf_${id}_${ci}_label';
 
   final Map<String, _DxfOverlay> _dxfOverlays = {};
 
@@ -1023,94 +1030,111 @@ class MapScreenState extends State<MapScreen> {
   Future<void> _addDxfOverlay(DxfImport imp) async {
     final c = _controller;
     if (c == null) return;
-    final st = _DxfOverlay(imp);
+    final Map<String, List<Map<String, dynamic>>> features;
     try {
-      st.features = await readDxfCache(_scope.library.dxfCachePath(imp));
+      features = await readDxfCache(_scope.library.dxfCachePath(imp));
     } catch (e) {
       debugPrint('Patok: DXF cache unreadable for ${imp.id}: $e');
+      _dxfError('Could not read the drawing cache for "${imp.name}".');
       return;
     }
-    final colorSet = <String>{};
-    for (final feats in st.features.values) {
-      for (final f in feats) {
-        final props = f['properties'] as Map;
-        if (props['kind'] != 'label') {
-          colorSet.add(props['color'] as String);
-        }
-      }
-    }
-    st.colors = colorSet.toList()..sort();
-    final sid = _dxfSourceId(imp.id);
-    try {
-      await c.addGeoJsonSource(sid, _dxfSourceData(st));
-    } catch (e) {
-      debugPrint('Patok: DXF source failed for ${imp.id}: $e');
-      return;
-    }
+    final st = _DxfOverlay(imp)
+      ..chunks = [
+        for (final c in chunkDxfFeatures(features))
+          _DxfChunk(c, _chunkColors(c)),
+      ];
     // Register before adding layers so a mid-add failure still cleans up.
     _dxfOverlays[imp.id] = st;
     try {
-      // Each layer goes directly below the annotation stack: later adds
-      // end up above earlier ones, so add fills first, labels last.
-      for (var i = 0; i < st.colors.length; i++) {
-        final color = st.colors[i];
-        await c.addFillLayer(
+      for (var ci = 0; ci < st.chunks.length; ci++) {
+        final chunk = st.chunks[ci];
+        final sid = _dxfSourceId(imp.id, ci);
+        await c.addGeoJsonSource(sid, _dxfChunkData(st, chunk));
+        // Each layer goes directly below the annotation stack: later adds
+        // end up above earlier ones, so add fills first, labels last.
+        for (var li = 0; li < chunk.colors.length; li++) {
+          final color = chunk.colors[li];
+          await c.addFillLayer(
+            sid,
+            _dxfFillId(imp.id, ci, li),
+            FillLayerProperties(
+              fillColor: color,
+              fillOpacity: 0.35 * imp.opacity,
+            ),
+            belowLayerId: _lyrGrid,
+            filter: _dxfFilter('fill', color),
+          );
+          st.layerIds.add(_dxfFillId(imp.id, ci, li));
+        }
+        for (var li = 0; li < chunk.colors.length; li++) {
+          final color = chunk.colors[li];
+          await c.addLineLayer(
+            sid,
+            _dxfLineId(imp.id, ci, li),
+            LineLayerProperties(lineColor: color, lineWidth: 2.0),
+            belowLayerId: _lyrGrid,
+            filter: _dxfFilter('line', color),
+          );
+          st.layerIds.add(_dxfLineId(imp.id, ci, li));
+        }
+        for (var li = 0; li < chunk.colors.length; li++) {
+          final color = chunk.colors[li];
+          await c.addCircleLayer(
+            sid,
+            _dxfPointId(imp.id, ci, li),
+            CircleLayerProperties(
+              circleColor: color,
+              circleRadius: 5.0,
+              circleStrokeWidth: 1.5,
+              circleStrokeColor: '#000000',
+            ),
+            belowLayerId: _lyrGrid,
+            filter: _dxfFilter('point', color),
+          );
+          st.layerIds.add(_dxfPointId(imp.id, ci, li));
+        }
+        await c.addSymbolLayer(
           sid,
-          _dxfFillId(imp.id, i),
-          FillLayerProperties(
-            fillColor: color,
-            fillOpacity: 0.35 * imp.opacity,
+          _dxfLabelId(imp.id, ci),
+          const SymbolLayerProperties(
+            textField: '{text}',
+            textSize: 12.0,
+            textColor: '#FFFFFF',
+            textHaloColor: '#000000',
+            textHaloWidth: 1.5,
           ),
           belowLayerId: _lyrGrid,
-          filter: _dxfFilter('fill', color),
+          filter: _dxfFilter('label', null),
         );
-        st.layerIds.add(_dxfFillId(imp.id, i));
+        st.layerIds.add(_dxfLabelId(imp.id, ci));
       }
-      for (var i = 0; i < st.colors.length; i++) {
-        final color = st.colors[i];
-        await c.addLineLayer(
-          sid,
-          _dxfLineId(imp.id, i),
-          LineLayerProperties(lineColor: color, lineWidth: 2.0),
-          belowLayerId: _lyrGrid,
-          filter: _dxfFilter('line', color),
-        );
-        st.layerIds.add(_dxfLineId(imp.id, i));
-      }
-      for (var i = 0; i < st.colors.length; i++) {
-        final color = st.colors[i];
-        await c.addCircleLayer(
-          sid,
-          _dxfPointId(imp.id, i),
-          CircleLayerProperties(
-            circleColor: color,
-            circleRadius: 5.0,
-            circleStrokeWidth: 1.5,
-            circleStrokeColor: '#000000',
-          ),
-          belowLayerId: _lyrGrid,
-          filter: _dxfFilter('point', color),
-        );
-        st.layerIds.add(_dxfPointId(imp.id, i));
-      }
-      await c.addSymbolLayer(
-        sid,
-        _dxfLabelId(imp.id),
-        const SymbolLayerProperties(
-          textField: '{text}',
-          textSize: 12.0,
-          textColor: '#FFFFFF',
-          textHaloColor: '#000000',
-          textHaloWidth: 1.5,
-        ),
-        belowLayerId: _lyrGrid,
-        filter: _dxfFilter('label', null),
-      );
-      st.layerIds.add(_dxfLabelId(imp.id));
     } catch (e) {
       debugPrint('Patok: adding DXF overlay failed: $e');
       await _removeDxfOverlay(imp.id);
+      _dxfError('Could not display "${imp.name}" on the map.');
     }
+  }
+
+  /// Surfaces a DXF overlay failure where the user can see it (the
+  /// add path used to only debugPrint, which looked like a success).
+  void _dxfError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  static List<String> _chunkColors(
+    Map<String, List<Map<String, dynamic>>> byCadLayer,
+  ) {
+    final set = <String>{};
+    for (final feats in byCadLayer.values) {
+      for (final f in feats) {
+        final props = f['properties'] as Map;
+        if (props['kind'] != 'label') set.add(props['color'] as String);
+      }
+    }
+    return set.toList()..sort();
   }
 
   static List<dynamic> _dxfFilter(String kind, String? color) => [
@@ -1128,11 +1152,16 @@ class MapScreenState extends State<MapScreen> {
           ],
       ];
 
-  /// Source data: features of the CAD layers currently toggled on.
-  Map<String, dynamic> _dxfSourceData(_DxfOverlay st) => {
+  /// One chunk's source data: features of the CAD layers currently
+  /// toggled on.
+  Map<String, dynamic> _dxfChunkData(
+    _DxfOverlay st,
+    _DxfChunk chunk,
+  ) =>
+      {
         'type': 'FeatureCollection',
         'features': [
-          for (final entry in st.features.entries)
+          for (final entry in chunk.byCadLayer.entries)
             if (st.imp.cadLayers[entry.key] ?? true) ...entry.value,
         ],
       };
@@ -1146,18 +1175,25 @@ class MapScreenState extends State<MapScreen> {
         await c.removeLayer(lid);
       } catch (_) {}
     }
-    try {
-      await c.removeSource(_dxfSourceId(id));
-    } catch (_) {}
+    for (var ci = 0; ci < st.chunks.length; ci++) {
+      try {
+        await c.removeSource(_dxfSourceId(id, ci));
+      } catch (_) {}
+    }
   }
 
-  /// Rewrites one import's source after CAD-layer toggles.
+  /// Rewrites one import's chunk sources after CAD-layer toggles.
   Future<void> _updateDxfData(String id) async {
     final c = _controller;
     final st = _dxfOverlays[id];
     if (c == null || st == null) return;
     try {
-      await c.setGeoJsonSource(_dxfSourceId(id), _dxfSourceData(st));
+      for (var ci = 0; ci < st.chunks.length; ci++) {
+        await c.setGeoJsonSource(
+          _dxfSourceId(id, ci),
+          _dxfChunkData(st, st.chunks[ci]),
+        );
+      }
     } catch (e) {
       debugPrint('Patok: DXF data update failed: $e');
     }
@@ -1169,24 +1205,27 @@ class MapScreenState extends State<MapScreen> {
     final st = _dxfOverlays[imp.id];
     if (c == null || st == null) return;
     try {
-      for (var i = 0; i < st.colors.length; i++) {
+      for (var ci = 0; ci < st.chunks.length; ci++) {
+        final chunk = st.chunks[ci];
+        for (var li = 0; li < chunk.colors.length; li++) {
+          await c.setLayerProperties(
+            _dxfFillId(imp.id, ci, li),
+            FillLayerProperties(fillOpacity: 0.35 * imp.opacity),
+          );
+          await c.setLayerProperties(
+            _dxfLineId(imp.id, ci, li),
+            LineLayerProperties(lineOpacity: imp.opacity),
+          );
+          await c.setLayerProperties(
+            _dxfPointId(imp.id, ci, li),
+            CircleLayerProperties(circleOpacity: imp.opacity),
+          );
+        }
         await c.setLayerProperties(
-          _dxfFillId(imp.id, i),
-          FillLayerProperties(fillOpacity: 0.35 * imp.opacity),
-        );
-        await c.setLayerProperties(
-          _dxfLineId(imp.id, i),
-          LineLayerProperties(lineOpacity: imp.opacity),
-        );
-        await c.setLayerProperties(
-          _dxfPointId(imp.id, i),
-          CircleLayerProperties(circleOpacity: imp.opacity),
+          _dxfLabelId(imp.id, ci),
+          SymbolLayerProperties(textOpacity: imp.opacity),
         );
       }
-      await c.setLayerProperties(
-        _dxfLabelId(imp.id),
-        SymbolLayerProperties(textOpacity: imp.opacity),
-      );
     } catch (e) {
       debugPrint('Patok: DXF opacity failed: $e');
     }
@@ -2231,14 +2270,24 @@ class _DxfOverlay {
   /// The library entry (replaced if the model object is reloaded).
   DxfImport imp;
 
-  /// All CAD layers -> their GeoJSON features (unfiltered).
-  Map<String, List<Map<String, dynamic>>> features = {};
-
-  /// Distinct non-label colors, sorted; index selects the layer suffix.
-  List<String> colors = [];
+  /// Size-bounded feature chunks (see [_chunkDxfFeatures]): one GeoJSON
+  /// source per chunk, because a whole drawing won't fit through the
+  /// ~1MB method-channel limit.
+  List<_DxfChunk> chunks = [];
 
   /// MapLibre layer ids created for this import (for removal).
   final List<String> layerIds = [];
+}
+
+/// One size-bounded slice of an import's features.
+class _DxfChunk {
+  _DxfChunk(this.byCadLayer, this.colors);
+
+  /// CAD layer -> features in this chunk (all layers, unfiltered).
+  final Map<String, List<Map<String, dynamic>>> byCadLayer;
+
+  /// Distinct non-label colors in this chunk (selects layer suffixes).
+  final List<String> colors;
 }
 
 /// Dynamic scale bar: picks a nice round distance for ~90px at the
