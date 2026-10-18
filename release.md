@@ -1,23 +1,15 @@
-# Patok v1.0.4
+# Patok v1.0.5
 
-Faster sharp-detail rendering when zoomed in, plus placement and
-maintenance tools.
+Follow-me GPS tracking, a recording indicator, and friendlier editing.
 
 ## What's new
-- Crosshair placement mode: a center crosshair with one-tap buttons to
-  drop measure points and waypoints exactly at the screen center
-- Storage manager in Settings: per-map disk usage with one-tap clearing
-  of cached previews
-- Compass calibration nudge: a one-time hint to wave the phone in a
-  figure-8 when heading accuracy is poor
-- Detail rendering is faster: the PDF stays open between renders instead
-  of being re-parsed every time, pages render in parallel, and rapid
-  pans settle briefly before re-rendering
-- Tapping a waypoint pin on the map now opens a detail sheet with
-  its name, note, coordinates, and Center/Rename/Delete actions
-- Field tab refreshes when switching to it, so waypoints added from the
-  map show up immediately
-- Smoother map performance: annotations no longer reload from disk on
-  every pan/zoom, and track recording redraws only the track line
-- Files shared to Patok (e.g. from WhatsApp) now keep their original
-  filename in the library instead of "shared_<number>"
+- Follow-me mode: the GPS button now keeps the map centered on your
+  position while you move; tap again or pan manually to stop
+- Reset-north button: snaps the map rotation back to north-up
+- Live recording pill on the map: shows REC time and point count while
+  a track records, tap to jump to the Field tab
+- Measure panel now lists each leg's distance, not just the total
+- Library cards show each map's file size
+- Undo delete: deleting a map, waypoint, or measurement now offers
+  Undo in a snackbar
+- Haptic feedback when placing waypoints and measure points

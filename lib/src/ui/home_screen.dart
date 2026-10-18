@@ -125,7 +125,8 @@ class _HomeScreenState extends State<HomeScreen> {
       body: IndexedStack(
         index: _index,
         children: [
-          MapScreen(key: _mapKey, onBrowseMaps: _goToLibrary),
+          MapScreen(
+              key: _mapKey, onBrowseMaps: _goToLibrary, onOpenField: () => _onTab(2)),
           LibraryScreen(onOpenMap: _openMap),
           FieldScreen(
             key: _fieldKey,

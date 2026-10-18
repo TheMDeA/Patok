@@ -671,6 +671,14 @@ class TrackRecorder {
   final ValueNotifier<bool> isRecording = ValueNotifier(false);
   final ValueNotifier<int> pointCount = ValueNotifier(0);
 
+  /// When the current recording started (null when idle).
+  DateTime? startTime;
+
+  /// Elapsed recording time (zero when idle).
+  Duration get elapsed => startTime == null
+      ? Duration.zero
+      : DateTime.now().difference(startTime!);
+
   /// Live (lon, lat) points while recording; empty when idle.
   final ValueNotifier<List<List<double>>> livePoints = ValueNotifier(const []);
 
@@ -690,6 +698,7 @@ class TrackRecorder {
       pointCount.value = _points.length;
       livePoints.value = List.unmodifiable(_points);
     });
+    startTime = DateTime.now();
     isRecording.value = true;
   }
 
@@ -699,6 +708,7 @@ class TrackRecorder {
     await _sub?.cancel();
     _sub = null;
     isRecording.value = false;
+    startTime = null;
     final points = List<List<double>>.of(_points);
     _points.clear();
     pointCount.value = 0;
@@ -725,6 +735,7 @@ class TrackRecorder {
     await _sub?.cancel();
     _sub = null;
     isRecording.value = false;
+    startTime = null;
     _points.clear();
     pointCount.value = 0;
     livePoints.value = const [];

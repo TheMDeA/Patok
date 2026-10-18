@@ -5,6 +5,20 @@ and concise.
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-10-18
+
+### Added
+- Follow-me mode: the GPS button now keeps the map centered on your
+  position while you move; tap again or pan manually to stop
+- Reset-north button: snaps the map rotation back to north-up
+- Measure panel now lists each leg's distance, not just the total
+- Live recording pill on the map: shows REC time and point count while
+  a track records, tap to jump to the Field tab
+- Library cards show each map's file size
+- Undo delete: deleting a map, waypoint, or measurement now offers
+  Undo in a snackbar
+- Haptic feedback when placing waypoints and measure points
+
 ## [1.0.4] - 2026-10-18
 
 ### Added

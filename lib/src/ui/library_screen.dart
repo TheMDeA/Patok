@@ -27,6 +27,38 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String _query = '';
   _Filter _filter = _Filter.recent;
 
+  /// Map id -> formatted PDF size, refreshed when the library changes.
+  final Map<String, String> _sizes = {};
+
+  /// Last deleted map + its PDF moved aside, for snackbar undo.
+  GeoMap? _lastDeletedMap;
+  File? _lastDeletedBackup;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshSizes();
+  }
+
+  void _refreshSizes() {
+    final lib = AppScope.of(context).library;
+    _sizes.clear();
+    for (final m in lib.maps) {
+      try {
+        final bytes = File(lib.pdfPath(m)).statSync().size;
+        _sizes[m.id] = _fmtSize(bytes);
+      } catch (_) {
+        // File missing (e.g. mid-import): leave the size blank.
+      }
+    }
+  }
+
+  static String _fmtSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
+  }
+
   List<GeoMap> get _visibleMaps {
     final maps = AppScope.of(context).library.maps;
     var list = maps.where((m) {
@@ -52,6 +84,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       MaterialPageRoute(builder: (_) => const ImportScreen()),
     );
     if (result != null && mounted) {
+      _refreshSizes();
       setState(() {});
       widget.onOpenMap(result);
     } else if (mounted) {
@@ -84,10 +117,56 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ),
     );
     if (ok == true) {
+      // Drop any older pending-undo backup first.
+      final oldBackup = _lastDeletedBackup;
+      _lastDeletedMap = null;
+      _lastDeletedBackup = null;
+      if (oldBackup != null) {
+        try {
+          await oldBackup.delete();
+        } catch (_) {}
+      }
+      // Move the PDF aside instead of deleting, so Undo can restore it.
+      final pdfPath = scope.library.pdfPath(m);
+      final backup = File('$pdfPath.undo');
+      try {
+        if (await File(pdfPath).exists()) {
+          await File(pdfPath).rename(backup.path);
+          _lastDeletedMap = m;
+          _lastDeletedBackup = backup;
+        }
+      } catch (_) {}
       await scope.library.remove(m);
       await scope.thumbnailService.deleteThumbnail(m.id);
-      if (mounted) setState(() {});
+      _sizes.remove(m.id);
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('"${m.name}" deleted'),
+            action: SnackBarAction(label: 'Undo', onPressed: _undoDelete),
+          ),
+        );
+      }
     }
+  }
+
+  /// Restores the last deleted map (PDF moved back, entry re-added).
+  Future<void> _undoDelete() async {
+    final m = _lastDeletedMap;
+    final backup = _lastDeletedBackup;
+    _lastDeletedMap = null;
+    _lastDeletedBackup = null;
+    if (m == null || backup == null || !mounted) return;
+    final scope = AppScope.of(context);
+    try {
+      await backup.rename(scope.library.pdfPath(m));
+    } catch (_) {}
+    scope.library.maps.add(m);
+    await scope.library.save();
+    _refreshSizes();
+    setState(() {});
+    // The thumbnail rebuilds on demand via backfill.
   }
 
   @override
@@ -209,6 +288,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   padding: const EdgeInsets.only(bottom: 10),
                   child: _MapCard(
                     map: m,
+                    sizeLabel: _sizes[m.id],
                     onOpen: () => widget.onOpenMap(m),
                     onToggleFavorite: () => _toggleFavorite(m),
                     onDelete: () => _delete(m),
@@ -341,12 +421,16 @@ class _ThumbnailState extends State<_Thumbnail> {
 class _MapCard extends StatelessWidget {
   const _MapCard({
     required this.map,
+    required this.sizeLabel,
     required this.onOpen,
     required this.onToggleFavorite,
     required this.onDelete,
     required this.onShowInfo,
   });
   final GeoMap map;
+
+  /// Formatted PDF size (e.g. "48.2 MB"), or null when unknown.
+  final String? sizeLabel;
   final VoidCallback onOpen;
   final VoidCallback onToggleFavorite;
   final VoidCallback onDelete;
@@ -372,7 +456,9 @@ class _MapCard extends StatelessWidget {
                         style: Theme.of(context).textTheme.titleMedium),
                     const SizedBox(height: 4),
                     Text(
-                      '${map.pages.length} georeferenced page(s)',
+                      sizeLabel != null
+                          ? '$sizeLabel • ${map.pages.length} georeferenced page(s)'
+                          : '${map.pages.length} georeferenced page(s)',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                     if (map.pages.isNotEmpty &&

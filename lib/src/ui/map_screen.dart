@@ -23,10 +23,13 @@ const _uuid = Uuid();
 /// Lives inside [HomeScreen]'s tab stack; cross-tab actions (open map,
 /// start measure, go to GPS) go through the public methods below.
 class MapScreen extends StatefulWidget {
-  const MapScreen({super.key, this.onBrowseMaps});
+  const MapScreen({super.key, this.onBrowseMaps, this.onOpenField});
 
   /// Called when the user taps the empty-state button (no maps yet).
   final VoidCallback? onBrowseMaps;
+
+  /// Called when the user taps the recording pill (jump to Field tab).
+  final VoidCallback? onOpenField;
 
   @override
   State<MapScreen> createState() => MapScreenState();
@@ -54,7 +57,8 @@ class MapScreenState extends State<MapScreen> {
   final Set<String> _detailSourceIds = {};
   int _detailGen = 0; // cancels stale in-flight detail renders
   Timer? _detailDebounce; // settle-debounce for detail renders
-  bool _precisionMode = false; // crosshair placement mode
+  bool _precisionMode = false;
+  bool _followMe = false; // crosshair placement mode
   bool _compassNudgeShown = false; // figure-8 nudge, once per session
   bool _showCompassNudge = false;
   String _detailKey = ''; // page + quantized viewport + zoom bucket
@@ -1033,6 +1037,7 @@ class MapScreenState extends State<MapScreen> {
 
   Future<void> _onMapClick(math.Point<double> point, LatLng latLng) async {
     if (_measureMode) {
+      HapticFeedback.lightImpact();
       setState(() => _measurePoints.add(latLng));
       await _redrawFieldData();
       return;
@@ -1163,13 +1168,27 @@ class MapScreenState extends State<MapScreen> {
                     ),
                     onPressed: () async {
                       Navigator.pop(ctx);
+                      final idx =
+                          _wpsCache.indexWhere((e) => e.id == wp.id);
                       _wpsCache.removeWhere((w) => w.id == wp.id);
                       await _scope.fieldData.saveWaypoints(_wpsCache);
                       await _redrawFieldData();
                       if (mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(
-                              content: Text('Waypoint "${wp.name}" deleted')),
+                            content:
+                                Text('Waypoint "${wp.name}" deleted'),
+                            action: SnackBarAction(
+                              label: 'Undo',
+                              onPressed: () async {
+                                _wpsCache.insert(
+                                    idx.clamp(0, _wpsCache.length), wp);
+                                await _scope.fieldData
+                                    .saveWaypoints(_wpsCache);
+                                await _redrawFieldData();
+                              },
+                            ),
+                          ),
                         );
                       }
                     },
@@ -1204,6 +1223,7 @@ class MapScreenState extends State<MapScreen> {
     final center = await _mapCenter();
     if (center == null) return;
     if (!_measureMode) _toggleMeasure();
+    HapticFeedback.lightImpact();
     setState(() => _measurePoints.add(center));
     await _redrawFieldData();
   }
@@ -1224,6 +1244,7 @@ class MapScreenState extends State<MapScreen> {
     ));
     await _scope.fieldData.saveWaypoints(_wpsCache);
     await _redrawFieldData();
+    HapticFeedback.mediumImpact();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Waypoint "$name" added')),
@@ -1307,7 +1328,14 @@ class MapScreenState extends State<MapScreen> {
 
   // ----------------------------------------------------------------- gps
 
+  /// GPS button: first tap centers on the GPS fix and enables follow-me
+  /// mode (the map keeps the position centered); tapping again, or panning
+  /// the map manually, stops following.
   Future<void> _goToGps() async {
+    if (_followMe) {
+      setState(() => _followMe = false);
+      return;
+    }
     var pos = _lastGps ?? await _scope.locationService.currentPosition();
     if (pos == null) {
       if (mounted) {
@@ -1316,9 +1344,15 @@ class MapScreenState extends State<MapScreen> {
       }
       return;
     }
+    setState(() => _followMe = true);
     await _controller?.animateCamera(
       CameraUpdate.newLatLngZoom(LatLng(pos.latitude, pos.longitude), 16),
     );
+  }
+
+  /// Snaps the map rotation back to north-up, keeping the current center.
+  Future<void> _resetNorth() async {
+    await _controller?.animateCamera(CameraUpdate.bearingTo(0));
   }
 
   // ----------------------------------------------------------- readout
@@ -1394,7 +1428,13 @@ class MapScreenState extends State<MapScreen> {
               styleString: _styleJson!,
               myLocationEnabled: true,
               myLocationRenderMode: MyLocationRenderMode.compass,
-              myLocationTrackingMode: MyLocationTrackingMode.none,
+              myLocationTrackingMode: _followMe
+                  ? MyLocationTrackingMode.tracking
+                  : MyLocationTrackingMode.none,
+              onCameraTrackingDismissed: () {
+                // The user panned away manually: stop following.
+                if (_followMe && mounted) setState(() => _followMe = false);
+              },
               initialCameraPosition: const CameraPosition(
                 target: LatLng(-6.2, 106.8), // Jakarta; moves on first import
                 zoom: 5,
@@ -1459,6 +1499,19 @@ class MapScreenState extends State<MapScreen> {
             const IgnorePointer(
               child: Center(child: _Crosshair()),
             ),
+          // Live track-recording pill (tap to jump to the Field tab).
+          Positioned(
+            top: 12,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: ValueListenableBuilder<bool>(
+                valueListenable: _trackRecorder.isRecording,
+                builder: (context, recording, _) =>
+                    recording ? _RecPill(onTap: widget.onOpenField) : const SizedBox.shrink(),
+              ),
+            ),
+          ),
           // Compass calibration nudge (once per session).
           if (_showCompassNudge)
             Positioned(
@@ -1550,8 +1603,18 @@ class MapScreenState extends State<MapScreen> {
                   children: [
                     FloatingActionButton.small(
                       heroTag: 'gps',
+                      tooltip: 'Follow my location',
+                      backgroundColor:
+                          _followMe ? PatokTheme.accent : null,
                       onPressed: _goToGps,
                       child: const Icon(Icons.my_location),
+                    ),
+                    const SizedBox(height: 10),
+                    FloatingActionButton.small(
+                      heroTag: 'north',
+                      tooltip: 'Reset north',
+                      onPressed: _resetNorth,
+                      child: const Icon(Icons.navigation),
                     ),
                     const SizedBox(height: 10),
                     FloatingActionButton.small(
@@ -1615,7 +1678,7 @@ class MapScreenState extends State<MapScreen> {
                         ? _MeasurePanel(
                             lengthMeters: _measureLength,
                             areaSqMeters: _measureArea,
-                            pointCount: _measurePoints.length,
+                            points: _measurePoints,
                             onUndo: () async {
                               if (_measurePoints.isNotEmpty) {
                                 setState(() => _measurePoints.removeLast());
@@ -1883,17 +1946,33 @@ class _MeasurePanel extends StatelessWidget {
   const _MeasurePanel({
     required this.lengthMeters,
     required this.areaSqMeters,
-    required this.pointCount,
+    required this.points,
     required this.onUndo,
     required this.onSave,
     required this.onClose,
   });
   final double lengthMeters;
   final double areaSqMeters;
-  final int pointCount;
+  final List<LatLng> points;
   final VoidCallback onUndo;
   final VoidCallback onSave;
   final VoidCallback onClose;
+
+  int get pointCount => points.length;
+
+  /// Length of each leg between consecutive points, in meters.
+  List<double> get _legs => [
+        for (var i = 1; i < points.length; i++)
+          Geolocator.distanceBetween(
+            points[i - 1].latitude,
+            points[i - 1].longitude,
+            points[i].latitude,
+            points[i].longitude,
+          ),
+      ];
+
+  String _fmtLeg(double m) =>
+      m < 1000 ? '${m.toStringAsFixed(1)} m' : '${(m / 1000).toStringAsFixed(2)} km';
 
   String get _formatted {
     if (lengthMeters < 1000) return '${lengthMeters.toStringAsFixed(1)} m';
@@ -1939,6 +2018,38 @@ class _MeasurePanel extends StatelessWidget {
             '$pointCount point(s) — tap map to add',
             style: Theme.of(context).textTheme.bodySmall,
           ),
+          if (_legs.isNotEmpty)
+            Theme(
+              data: Theme.of(context).copyWith(
+                dividerColor: Colors.transparent,
+              ),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                title: Text(
+                  'Legs (${_legs.length})',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                children: [
+                  for (var i = 0; i < _legs.length; i++)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Row(
+                        children: [
+                          Text(
+                            '${i + 1} → ${i + 2}',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const Spacer(),
+                          Text(
+                            _fmtLeg(_legs[i]),
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -2131,4 +2242,75 @@ class _DetailTarget {
   final double maxLon;
   final double maxLat;
   final double targetWidthPx;
+}
+
+/// Live track-recording pill shown at the top of the map while recording.
+/// Taps jump to the Field tab (where stop/save lives).
+class _RecPill extends StatefulWidget {
+  const _RecPill({required this.onTap});
+  final VoidCallback? onTap;
+
+  @override
+  State<_RecPill> createState() => _RecPillState();
+}
+
+class _RecPillState extends State<_RecPill> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final recorder = AppScope.of(context).trackRecorder;
+    final e = recorder.elapsed;
+    final mm = e.inMinutes.toString().padLeft(2, '0');
+    final ss = (e.inSeconds % 60).toString().padLeft(2, '0');
+    return SafeArea(
+      bottom: false,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          decoration: BoxDecoration(
+            color: PatokTheme.surface.withValues(alpha: 0.92),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.redAccent.withValues(alpha: 0.6)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: const BoxDecoration(
+                  color: Colors.redAccent,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'REC $mm:$ss • ${recorder.pointCount.value} pts',
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

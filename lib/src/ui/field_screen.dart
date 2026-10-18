@@ -334,13 +334,34 @@ class FieldScreenState extends State<FieldScreen> {
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () async {
+                              final store = scope.fieldData;
+                              final messenger = ScaffoldMessenger.of(context);
+                              final idx = _waypoints.indexOf(w);
                               final wps =
                                   List<Waypoint>.of(_waypoints)
                                     ..removeWhere(
                                         (e) => e.id == w.id);
-                              await scope.fieldData
-                                  .saveWaypoints(wps);
+                              await store.saveWaypoints(wps);
                               await _reload();
+                              messenger.showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                        'Waypoint "${w.name}" deleted'),
+                                    action: SnackBarAction(
+                                      label: 'Undo',
+                                      onPressed: () async {
+                                        final restored =
+                                            List<Waypoint>.of(_waypoints)
+                                              ..insert(
+                                                  idx.clamp(
+                                                      0, _waypoints.length),
+                                                  w);
+                                        await store.saveWaypoints(restored);
+                                        await _reload();
+                                      },
+                                    ),
+                                  ),
+                                );
                             },
                           ),
                         ),
@@ -366,13 +387,36 @@ class FieldScreenState extends State<FieldScreen> {
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () async {
+                              final store = scope.fieldData;
+                              final messenger = ScaffoldMessenger.of(context);
+                              final idx = _measurements.indexOf(m);
                               final ms =
                                   List<Measurement>.of(_measurements)
                                     ..removeWhere(
                                         (e) => e.id == m.id);
-                              await scope.fieldData
-                                  .saveMeasurements(ms);
+                              await store.saveMeasurements(ms);
                               await _reload();
+                              messenger.showSnackBar(
+                                  SnackBar(
+                                    content:
+                                        Text('"${m.name}" deleted'),
+                                    action: SnackBarAction(
+                                      label: 'Undo',
+                                      onPressed: () async {
+                                        final restored =
+                                            List<Measurement>.of(
+                                                    _measurements)
+                                              ..insert(
+                                                  idx.clamp(0,
+                                                      _measurements.length),
+                                                  m);
+                                        await store
+                                            .saveMeasurements(restored);
+                                        await _reload();
+                                      },
+                                    ),
+                                  ),
+                                );
                             },
                           ),
                         ),
