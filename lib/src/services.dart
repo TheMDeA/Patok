@@ -495,6 +495,7 @@ class ImportService {
 /// speeds up the first fix).
 class LocationService {
   Stream<Position>? _stream;
+  Stream<Position>? _rawStream;
 
   Future<bool> ensurePermission() async {
     var perm = await Geolocator.checkPermission();
@@ -526,6 +527,18 @@ class LocationService {
       ),
     );
     return _stream!;
+  }
+
+  /// Time-based stream (no distance filter) for stationary work like
+  /// waypoint averaging — the main stream goes quiet when not moving.
+  Stream<Position> rawPositionStream() {
+    _rawStream ??= Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.best,
+        distanceFilter: 0,
+      ),
+    );
+    return _rawStream!;
   }
 }
 

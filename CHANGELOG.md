@@ -17,6 +17,10 @@ and concise.
 - Dynamic scale bar on the map
 - In-app update checker: check for updates in Settings, with optional
   daily auto-check and one-tap APK download/install
+- Waypoint averaging: stand still to average GPS fixes for a precise
+  waypoint, with live precision estimate
+- Map info panel: per-map georeferencing method, coordinate system,
+  page size, and bounds from the Library
 
 ### Fixed
 - Waypoints and saved measurements now appear on the map (map

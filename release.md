@@ -14,6 +14,10 @@ redesigned following the approved mockup — plus import and rendering fixes.
   and one-tap APK download/install
 - Area measurement: the measure tool shows polygon area (m²/ha) with
   a filled preview, saved with the measurement
+- Waypoint averaging: stand still to average GPS fixes for a precise
+  waypoint, with live precision estimate
+- Map info panel: per-map georeferencing method, coordinate system,
+  page size, and bounds from the Library
 - Dynamic scale bar on the map
 - Bottom navigation (Map | Library | Field); the app now opens on the
   Library instead of the map

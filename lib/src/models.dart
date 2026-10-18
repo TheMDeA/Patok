@@ -185,6 +185,7 @@ class Waypoint {
     required this.name,
     required this.longitude,
     required this.latitude,
+    this.note,
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.now();
 
@@ -192,6 +193,9 @@ class Waypoint {
   String name;
   final double longitude;
   final double latitude;
+
+  /// Optional free text, e.g. "averaged from 60 fixes".
+  final String? note;
   final DateTime createdAt;
 
   Map<String, dynamic> toJson() => {
@@ -199,6 +203,7 @@ class Waypoint {
         'name': name,
         'longitude': longitude,
         'latitude': latitude,
+        'note': note,
         'createdAt': createdAt.toIso8601String(),
       };
 
@@ -207,6 +212,7 @@ class Waypoint {
         name: j['name'] as String,
         longitude: (j['longitude'] as num).toDouble(),
         latitude: (j['latitude'] as num).toDouble(),
+        note: j['note'] as String?,
         createdAt: DateTime.parse(j['createdAt'] as String),
       );
 }

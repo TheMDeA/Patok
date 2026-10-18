@@ -5,6 +5,8 @@ import 'app_scope.dart';
 import '../geopdf/georef.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../waypoint_averaging.dart';
+import 'average_waypoint_sheet.dart';
 import 'settings_screen.dart';
 
 const _uuid = Uuid();
@@ -76,6 +78,31 @@ class _FieldScreenState extends State<FieldScreen> {
       ));
     await scope.fieldData.saveWaypoints(wps);
     await _reload();
+  }
+
+  Future<void> _averageWaypoint() async {
+    final scope = AppScope.of(context);
+    final averager = WaypointAverager(scope.locationService);
+    try {
+      final result = await showAverageWaypointSheet(context, averager);
+      if (result == null || !mounted) return;
+      final name =
+          await _askName(context, 'Waypoint ${_waypoints.length + 1}');
+      if (name == null) return;
+      final wps = List<Waypoint>.of(_waypoints)
+        ..add(Waypoint(
+          id: _uuid.v4(),
+          name: name,
+          longitude: result.longitude,
+          latitude: result.latitude,
+          note: 'Averaged from ${result.fixCount} fixes '
+              '(±${result.precisionMeters.toStringAsFixed(1)} m)',
+        ));
+      await scope.fieldData.saveWaypoints(wps);
+      await _reload();
+    } finally {
+      averager.dispose();
+    }
   }
 
   Future<String?> _askName(BuildContext context, String hint) {
@@ -255,6 +282,12 @@ class _FieldScreenState extends State<FieldScreen> {
                   onTap: _addWaypointAtGps,
                 ),
                 _ToolTile(
+                  icon: Icons.adjust,
+                  title: 'Average waypoint',
+                  subtitle: 'Stand still — average fixes for precision',
+                  onTap: _averageWaypoint,
+                ),
+                _ToolTile(
                   icon: Icons.straighten,
                   title: 'Measure',
                   subtitle: 'Distance on the map',
@@ -289,8 +322,10 @@ class _FieldScreenState extends State<FieldScreen> {
                           leading: const Icon(Icons.place,
                               color: PatokTheme.accent),
                           title: Text(w.name),
-                          subtitle:
-                              Text(formatUtm(w.longitude, w.latitude)),
+                          subtitle: Text(
+                            formatUtm(w.longitude, w.latitude) +
+                                (w.note != null ? '\n${w.note}' : ''),
+                          ),
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () async {

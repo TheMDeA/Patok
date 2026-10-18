@@ -4,6 +4,7 @@ import 'app_scope.dart';
 import '../models.dart';
 import '../theme.dart';
 import 'import_screen.dart';
+import 'map_info_sheet.dart';
 
 /// Map library like the approved mockup: search, a "bring your own map"
 /// import card, the offline library grouped by recency, and quick filters.
@@ -208,6 +209,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     onOpen: () => widget.onOpenMap(m),
                     onToggleFavorite: () => _toggleFavorite(m),
                     onDelete: () => _delete(m),
+                    onShowInfo: () => showMapInfoSheet(context, m),
                   ),
                 )),
           const SizedBox(height: 16),
@@ -276,11 +278,13 @@ class _MapCard extends StatelessWidget {
     required this.onOpen,
     required this.onToggleFavorite,
     required this.onDelete,
+    required this.onShowInfo,
   });
   final GeoMap map;
   final VoidCallback onOpen;
   final VoidCallback onToggleFavorite;
   final VoidCallback onDelete;
+  final VoidCallback onShowInfo;
 
   @override
   Widget build(BuildContext context) {
@@ -323,6 +327,11 @@ class _MapCard extends StatelessWidget {
                       ),
                   ],
                 ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.info_outline),
+                tooltip: 'Map info',
+                onPressed: onShowInfo,
               ),
               IconButton(
                 icon: Icon(
