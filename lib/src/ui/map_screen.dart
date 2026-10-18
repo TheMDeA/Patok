@@ -583,6 +583,18 @@ class MapScreenState extends State<MapScreen> {
 
   /// Opens a map: renders its overlay if needed, then zooms to it.
   Future<void> openMap(GeoMap map) async {
+    // Solo the opened map: hide the others so a newly imported map opens
+    // on its own instead of stacking over whatever was visible. Overlays
+    // can still be composed via the layers sheet.
+    var changed = false;
+    for (final m in _scope.library.maps) {
+      final want = m.id == map.id;
+      if (m.visible != want) {
+        m.visible = want;
+        changed = true;
+      }
+    }
+    if (changed) await _scope.library.save();
     await _refreshOverlays();
     await _zoomToMap(map);
   }

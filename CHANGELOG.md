@@ -18,6 +18,13 @@ and concise.
 - Undo delete: deleting a map, waypoint, or measurement now offers
   Undo in a snackbar
 - Haptic feedback when placing waypoints and measure points
+- Library cards have an "Add to overlay" (+) button to stack a map onto
+  the current view without opening it solo
+
+### Changed
+- Opening a map (from the library or after import) now shows just that
+  map instead of stacking over the previously visible ones; use the
+  layers sheet to overlay multiple maps
 
 ## [1.0.4] - 2026-10-18
 

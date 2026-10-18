@@ -98,6 +98,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
     await scope.library.save();
   }
 
+  /// Adds a map to the current overlay without opening (soloing) it. The
+  /// map screen picks the change up via its library fingerprint when the
+  /// Map tab becomes visible again.
+  Future<void> _addToOverlay(GeoMap m) async {
+    if (m.visible) return;
+    final scope = AppScope.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => m.visible = true);
+    await scope.library.save();
+    messenger.showSnackBar(
+      SnackBar(content: Text('"${m.name}" added to overlay')),
+    );
+  }
+
   Future<void> _delete(GeoMap m) async {
     final scope = AppScope.of(context);
     final ok = await showDialog<bool>(
@@ -293,6 +307,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     onToggleFavorite: () => _toggleFavorite(m),
                     onDelete: () => _delete(m),
                     onShowInfo: () => showMapInfoSheet(context, m),
+                    onAddToOverlay: m.visible ? null : () => _addToOverlay(m),
                   ),
                 )),
           const SizedBox(height: 16),
@@ -426,11 +441,15 @@ class _MapCard extends StatelessWidget {
     required this.onToggleFavorite,
     required this.onDelete,
     required this.onShowInfo,
+    required this.onAddToOverlay,
   });
   final GeoMap map;
 
   /// Formatted PDF size (e.g. "48.2 MB"), or null when unknown.
   final String? sizeLabel;
+
+  /// Adds the map to the current overlay; null when it's already visible.
+  final VoidCallback? onAddToOverlay;
   final VoidCallback onOpen;
   final VoidCallback onToggleFavorite;
   final VoidCallback onDelete;
@@ -477,6 +496,12 @@ class _MapCard extends StatelessWidget {
                 tooltip: 'Map info',
                 onPressed: onShowInfo,
               ),
+              if (onAddToOverlay != null)
+                IconButton(
+                  icon: const Icon(Icons.add),
+                  tooltip: 'Add to overlay',
+                  onPressed: onAddToOverlay,
+                ),
               IconButton(
                 icon: Icon(
                   map.isFavorite ? Icons.star : Icons.star_outline,

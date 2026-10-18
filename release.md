@@ -13,3 +13,6 @@ Follow-me GPS tracking, a recording indicator, and friendlier editing.
 - Undo delete: deleting a map, waypoint, or measurement now offers
   Undo in a snackbar
 - Haptic feedback when placing waypoints and measure points
+- Opening a map now shows just that map instead of stacking over the
+  previous ones; library cards have an "Add to overlay" (+) button to
+  stack maps back together
