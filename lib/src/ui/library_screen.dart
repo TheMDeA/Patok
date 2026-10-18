@@ -277,14 +277,40 @@ class _FilterChip extends StatelessWidget {
 
 /// Library card thumbnail: the map's first page rendered small, cached on
 /// disk. Falls back to the map icon while loading or when unavailable.
-class _Thumbnail extends StatelessWidget {
+/// The load future is cached per widget so parent rebuilds don't restart it.
+class _Thumbnail extends StatefulWidget {
   const _Thumbnail({required this.map});
   final GeoMap map;
 
   @override
+  State<_Thumbnail> createState() => _ThumbnailState();
+}
+
+class _ThumbnailState extends State<_Thumbnail> {
+  late Future<File?> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = AppScope.of(context).thumbnailService.ensureThumbnail(
+      widget.map,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant _Thumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.map.id != widget.map.id) {
+      _future = AppScope.of(context).thumbnailService.ensureThumbnail(
+        widget.map,
+      );
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     return FutureBuilder<File?>(
-      future: AppScope.of(context).thumbnailService.ensureThumbnail(map),
+      future: _future,
       builder: (context, snap) {
         final file = snap.data;
         if (file == null) {

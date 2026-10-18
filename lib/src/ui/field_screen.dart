@@ -28,10 +28,10 @@ class FieldScreen extends StatefulWidget {
   final VoidCallback onMeasure;
 
   @override
-  State<FieldScreen> createState() => _FieldScreenState();
+  State<FieldScreen> createState() => FieldScreenState();
 }
 
-class _FieldScreenState extends State<FieldScreen> {
+class FieldScreenState extends State<FieldScreen> {
   List<Waypoint> _waypoints = [];
   List<Measurement> _measurements = [];
   bool _loading = true;
@@ -41,6 +41,11 @@ class _FieldScreenState extends State<FieldScreen> {
     super.initState();
     _reload();
   }
+
+  /// Reload lists from disk. Called by the home shell when the Field tab
+  /// becomes visible, so waypoints added elsewhere (e.g. the map's
+  /// crosshair mode) show up immediately.
+  Future<void> refresh() => _reload();
 
   Future<void> _reload() async {
     final store = AppScope.of(context).fieldData;

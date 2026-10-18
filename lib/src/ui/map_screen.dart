@@ -89,12 +89,13 @@ class MapScreenState extends State<MapScreen> {
     _startGps();
     _trackRecorder = AppScope.of(context).trackRecorder;
     _gnssService = AppScope.of(context).gnssService;
+    _loadFieldData(); // warm the in-memory cache
     _trackRecorder.livePoints.addListener(_onTrackUpdate);
     _gnssService.satellites.addListener(_onSatellitesChanged);
   }
 
   void _onTrackUpdate() {
-    _redrawAnnotations();
+    _redrawTrack();
   }
 
   @override
@@ -133,6 +134,7 @@ class MapScreenState extends State<MapScreen> {
     _annLayersReady = false;
     await _ensureAnnotationLayers();
     await _refreshOverlays();
+    await _loadFieldData();
     await _redrawAnnotations();
   }
 
@@ -583,12 +585,14 @@ class MapScreenState extends State<MapScreen> {
 
   /// Called by the home shell when the Map tab becomes visible: refreshes
   /// overlays only if the library (or render DPI) changed while hidden,
-  /// and always redraws annotations (field data may have changed).
+  /// reloads field data (it may have changed in another tab), and always
+  /// redraws annotations.
   Future<void> didBecomeVisible() async {
     if (_libraryFingerprint() != _lastFingerprint ||
         _scope.settings.renderDpi != _lastDpi) {
       await _refreshOverlays();
     }
+    await _loadFieldData();
     _updateCoordReadout();
     await _redrawAnnotations();
     // Settings (e.g. the detail toggle) may have changed while away.
@@ -627,7 +631,7 @@ class MapScreenState extends State<MapScreen> {
         onGridChanged: (v) async {
           await _scope.settings.setShowUtmGrid(v);
           if (mounted) setState(() {});
-          await _redrawAnnotations();
+          await _redrawGrid();
         },
         onZoom: (m) {
           Navigator.pop(ctx);
@@ -801,22 +805,60 @@ class MapScreenState extends State<MapScreen> {
   /// Single clear + redraw for everything above the map: UTM grid (if
   /// enabled) -> saved measurements -> live track -> measure line ->
   /// waypoints. Only rewrites GeoJSON data; layer order never changes.
-  Future<void> _redrawAnnotations() async {
+  /// In-memory field data: waypoints/measurements are read from disk only
+  /// on init, when the tab becomes visible, and after local mutations —
+  /// never per-frame. (They used to be re-read on every camera idle.)
+  List<Waypoint> _wpsCache = [];
+  List<Measurement> _msCache = [];
+
+  Future<void> _loadFieldData() async {
+    _wpsCache = await _scope.fieldData.waypoints();
+    _msCache = await _scope.fieldData.measurements();
+  }
+
+  /// Viewport-dependent annotations only (UTM grid). Cheap; safe on every
+  /// camera idle.
+  Future<void> _redrawGrid() async {
     final c = _controller;
     if (c == null || !_annLayersReady) return;
     try {
-      // UTM grid.
       if (_scope.settings.showUtmGrid) {
         await c.setGeoJsonSource(_srcGrid, _linesFc(await _gridLineCoords(c)));
       } else {
         await c.setGeoJsonSource(_srcGrid, _emptyFc());
       }
+    } catch (e) {
+      debugPrint('Patok: _redrawGrid failed: $e');
+    }
+  }
 
+  /// Track line only — the per-fix path while recording. No disk I/O,
+  /// no other sources touched.
+  Future<void> _redrawTrack() async {
+    final c = _controller;
+    if (c == null || !_annLayersReady) return;
+    try {
+      final liveTrack = _trackRecorder.livePoints.value;
+      await c.setGeoJsonSource(
+        _srcTrack,
+        liveTrack.length >= 2 ? _linesFc([liveTrack]) : _emptyFc(),
+      );
+    } catch (e) {
+      debugPrint('Patok: _redrawTrack failed: $e');
+    }
+  }
+
+  /// Data-driven annotations (measurements, waypoints, live track, active
+  /// measure). Reads the in-memory cache — call after mutations via
+  /// [_loadFieldData] or by updating the cache directly.
+  Future<void> _redrawFieldData() async {
+    final c = _controller;
+    if (c == null || !_annLayersReady) return;
+    try {
       // Saved measurements (green); area ones draw as closed loops.
-      final ms = await _scope.fieldData.measurements();
       await c.setGeoJsonSource(
         _srcMeasurements,
-        _linesFc(ms.map(
+        _linesFc(_msCache.map(
           (m) => m.areaSqMeters != null && m.points.length >= 3
               ? [...m.points, m.points.first]
               : m.points,
@@ -867,15 +909,21 @@ class MapScreenState extends State<MapScreen> {
       }
 
       // Waypoints (blue pins).
-      final wps = await _scope.fieldData.waypoints();
       await c.setGeoJsonSource(
         _srcWaypoints,
-        _pointsFc(wps.map((w) => [w.longitude, w.latitude])),
+        _pointsFc(_wpsCache.map((w) => [w.longitude, w.latitude])),
       );
     } catch (e) {
-      debugPrint('Patok: _redrawAnnotations failed: $e');
+      debugPrint('Patok: _redrawFieldData failed: $e');
     }
     if (mounted) setState(() {});
+  }
+
+  /// Full refresh: grid + field data. For init, style reloads, and tab
+  /// switches — not for camera movement.
+  Future<void> _redrawAnnotations() async {
+    await _redrawGrid();
+    await _redrawFieldData();
   }
 
   /// UTM grid line coordinates ([lon, lat] pairs) for the visible region.
@@ -980,13 +1028,159 @@ class MapScreenState extends State<MapScreen> {
       _measureMode = !_measureMode;
       _measurePoints.clear();
     });
-    _redrawAnnotations();
+    _redrawFieldData();
   }
 
   Future<void> _onMapClick(math.Point<double> point, LatLng latLng) async {
-    if (!_measureMode) return;
-    setState(() => _measurePoints.add(latLng));
-    await _redrawAnnotations();
+    if (_measureMode) {
+      setState(() => _measurePoints.add(latLng));
+      await _redrawFieldData();
+      return;
+    }
+    // Waypoint hit-test: nearest cached waypoint within ~28 px. Tapping a
+    // pin opens its detail sheet.
+    final mpp = _metersPerPx.value;
+    if (mpp <= 0 || _wpsCache.isEmpty) return;
+    final thresholdMeters = 28 * mpp;
+    Waypoint? best;
+    var bestDist = double.infinity;
+    for (final w in _wpsCache) {
+      final d = Geolocator.distanceBetween(
+        latLng.latitude,
+        latLng.longitude,
+        w.latitude,
+        w.longitude,
+      );
+      if (d < thresholdMeters && d < bestDist) {
+        best = w;
+        bestDist = d;
+      }
+    }
+    if (best != null && mounted) _showWaypointSheet(best);
+  }
+
+  /// Detail sheet for a tapped waypoint pin: name, note, coordinates,
+  /// plus center / rename / delete actions.
+  Future<void> _showWaypointSheet(Waypoint wp) {
+    return showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.place, color: PatokTheme.accent, size: 28),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          wp.name,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        if (wp.note != null && wp.note!.isNotEmpty)
+                          Text(
+                            wp.note!,
+                            style: TextStyle(
+                              color: PatokTheme.onSurfaceDim,
+                              fontSize: 13,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      formatUtm(wp.longitude, wp.latitude),
+                      style: TextStyle(
+                        color: PatokTheme.onSurfaceDim,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Copy coordinates',
+                    icon: const Icon(Icons.copy, size: 20),
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(
+                        text:
+                            '${wp.latitude.toStringAsFixed(6)}, ${wp.longitude.toStringAsFixed(6)}',
+                      ));
+                      ScaffoldMessenger.of(ctx).showSnackBar(
+                        const SnackBar(content: Text('Coordinates copied')),
+                      );
+                    },
+                  ),
+                ],
+              ),
+              const Divider(),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  TextButton.icon(
+                    icon: const Icon(Icons.center_focus_strong),
+                    label: const Text('Center'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _controller?.moveCamera(
+                        CameraUpdate.newLatLng(
+                          LatLng(wp.latitude, wp.longitude),
+                        ),
+                      );
+                    },
+                  ),
+                  TextButton.icon(
+                    icon: const Icon(Icons.edit_outlined),
+                    label: const Text('Rename'),
+                    onPressed: () async {
+                      final name = await _askWaypointName(ctx, wp.name);
+                      if (!ctx.mounted) return;
+                      Navigator.pop(ctx);
+                      if (name == null || name.isEmpty || !mounted) return;
+                      wp.name = name;
+                      await _scope.fieldData.saveWaypoints(_wpsCache);
+                      await _redrawFieldData();
+                    },
+                  ),
+                  TextButton.icon(
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('Delete'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.redAccent,
+                    ),
+                    onPressed: () async {
+                      Navigator.pop(ctx);
+                      _wpsCache.removeWhere((w) => w.id == wp.id);
+                      await _scope.fieldData.saveWaypoints(_wpsCache);
+                      await _redrawFieldData();
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                              content: Text('Waypoint "${wp.name}" deleted')),
+                        );
+                      }
+                    },
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   /// Live map center from the visible region (never the stale cached
@@ -1011,28 +1205,25 @@ class MapScreenState extends State<MapScreen> {
     if (center == null) return;
     if (!_measureMode) _toggleMeasure();
     setState(() => _measurePoints.add(center));
-    await _redrawAnnotations();
+    await _redrawFieldData();
   }
 
   /// Crosshair: drop a planned waypoint exactly at the screen center.
   Future<void> _addWaypointAtCenter() async {
     final center = await _mapCenter();
     if (center == null || !mounted) return;
-    final existing = await _scope.fieldData.waypoints();
-    if (!mounted) return;
     final name =
-        await _askWaypointName(context, 'Waypoint ${existing.length + 1}');
+        await _askWaypointName(context, 'Waypoint ${_wpsCache.length + 1}');
     if (name == null || !mounted) return;
-    final wps = List<Waypoint>.of(existing)
-      ..add(Waypoint(
-        id: _uuid.v4(),
-        name: name,
-        longitude: center.longitude,
-        latitude: center.latitude,
-        note: 'Placed from map',
-      ));
-    await _scope.fieldData.saveWaypoints(wps);
-    await _redrawAnnotations();
+    _wpsCache.add(Waypoint(
+      id: _uuid.v4(),
+      name: name,
+      longitude: center.longitude,
+      latitude: center.latitude,
+      note: 'Placed from map',
+    ));
+    await _scope.fieldData.saveWaypoints(_wpsCache);
+    await _redrawFieldData();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Waypoint "$name" added')),
@@ -1097,8 +1288,7 @@ class MapScreenState extends State<MapScreen> {
   Future<void> _saveMeasurement() async {
     if (_measurePoints.length < 2) return;
     final name = 'Measurement ${_measurePoints.length} pts';
-    final ms = await _scope.fieldData.measurements();
-    ms.add(
+    _msCache.add(
       Measurement(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
         name: name,
@@ -1107,7 +1297,7 @@ class MapScreenState extends State<MapScreen> {
         areaSqMeters: _measurePoints.length >= 3 ? _measureArea : null,
       ),
     );
-    await _scope.fieldData.saveMeasurements(ms);
+    await _scope.fieldData.saveMeasurements(_msCache);
     if (mounted) {
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text('Measurement saved')));
@@ -1225,7 +1415,7 @@ class MapScreenState extends State<MapScreen> {
               onCameraIdle: () {
                 _refreshMetersPerPx();
                 _updateCoordReadout();
-                _redrawAnnotations();
+                _redrawGrid();
                 // Settle-debounce: a quick second gesture would cancel an
                 // in-flight render anyway, so wait briefly and render once.
                 _detailDebounce?.cancel();
@@ -1429,7 +1619,7 @@ class MapScreenState extends State<MapScreen> {
                             onUndo: () async {
                               if (_measurePoints.isNotEmpty) {
                                 setState(() => _measurePoints.removeLast());
-                                await _redrawAnnotations();
+                                await _redrawFieldData();
                               }
                             },
                             onSave: _saveMeasurement,

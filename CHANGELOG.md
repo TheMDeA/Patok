@@ -14,10 +14,21 @@ and concise.
   of cached previews
 - Compass calibration nudge: a one-time hint to wave the phone in a
   figure-8 when heading accuracy is poor
+- Tapping a waypoint pin on the map now opens a detail sheet with
+  its name, note, coordinates, and Center/Rename/Delete actions
 
 ### Fixed
+- Field tab now refreshes when switching to it, so waypoints added from
+  the map show up immediately
 - Detail rendering is faster: the PDF stays open between renders, pages
   render in parallel, and rapid pans settle before re-rendering
+
+### Performance
+- Map annotations no longer re-read waypoints/measurements from disk on
+  every pan/zoom — only the grid redraws on camera idle
+- Track recording updates just the track line per GPS fix instead of
+  rebuilding all annotations
+- Library thumbnails no longer restart their load on every list rebuild
 
 ## [1.0.3] - 2026-10-18
 

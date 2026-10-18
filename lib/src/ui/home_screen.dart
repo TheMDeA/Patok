@@ -27,6 +27,7 @@ class _HomeScreenState extends State<HomeScreen> {
   /// the library / main menu.
   int _index = 1;
   final _mapKey = GlobalKey<MapScreenState>();
+  final _fieldKey = GlobalKey<FieldScreenState>();
 
   MapScreenState? get _mapState => _mapKey.currentState;
 
@@ -109,11 +110,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onTab(int i) {
     setState(() => _index = i);
-    if (i == 0) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (i == 0) {
         _mapState?.didBecomeVisible();
-      });
-    }
+      } else if (i == 2) {
+        _fieldKey.currentState?.refresh();
+      }
+    });
   }
 
   @override
@@ -125,6 +128,7 @@ class _HomeScreenState extends State<HomeScreen> {
           MapScreen(key: _mapKey, onBrowseMaps: _goToLibrary),
           LibraryScreen(onOpenMap: _openMap),
           FieldScreen(
+            key: _fieldKey,
             onGoToGps: _goToGps,
             onMeasure: _startMeasure,
           ),
