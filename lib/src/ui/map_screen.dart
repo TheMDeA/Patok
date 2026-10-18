@@ -9,6 +9,8 @@ import 'package:proj4dart/proj4dart.dart' as proj4;
 import 'package:uuid/uuid.dart';
 
 import 'app_scope.dart';
+import '../dxf/dxf_crs.dart';
+import '../dxf/dxf_import.dart';
 import '../models.dart';
 import '../services.dart';
 import '../geopdf/georef.dart';
@@ -109,6 +111,9 @@ class MapScreenState extends State<MapScreen> {
     _gnssService.satellites.removeListener(_onSatellitesChanged);
     _metersPerPx.dispose();
     _detailDebounce?.cancel();
+    // Never leave a pick caller hanging.
+    _pickCompleter?.complete(null);
+    _pickCompleter = null;
     super.dispose();
   }
 
@@ -138,6 +143,10 @@ class MapScreenState extends State<MapScreen> {
     _annLayersReady = false;
     await _ensureAnnotationLayers();
     await _refreshOverlays();
+    // DXF native layers died with the style: drop the Dart-side tracking
+    // so _refreshDxfOverlays() re-adds them below.
+    _dxfOverlays.clear();
+    await _refreshDxfOverlays();
     await _loadFieldData();
     await _redrawAnnotations();
   }
@@ -599,6 +608,16 @@ class MapScreenState extends State<MapScreen> {
     await _zoomToMap(map);
   }
 
+  /// Opens a DXF import: makes it visible, renders its overlay, zooms to it.
+  Future<void> openDxf(DxfImport imp) async {
+    if (!imp.visible) {
+      imp.visible = true;
+      await _scope.library.save();
+    }
+    await _refreshDxfOverlays();
+    await _zoomToDxf(imp);
+  }
+
   /// Called by the home shell when the Map tab becomes visible: refreshes
   /// overlays only if the library (or render DPI) changed while hidden,
   /// reloads field data (it may have changed in another tab), and always
@@ -607,6 +626,7 @@ class MapScreenState extends State<MapScreen> {
     if (_libraryFingerprint() != _lastFingerprint ||
         _scope.settings.renderDpi != _lastDpi) {
       await _refreshOverlays();
+      await _refreshDxfOverlays();
     }
     await _loadFieldData();
     _updateCoordReadout();
@@ -620,6 +640,9 @@ class MapScreenState extends State<MapScreen> {
     if (!_measureMode) _toggleMeasure();
   }
 
+  /// Whether the native map controller is ready (for cross-tab pick flows).
+  bool get isMapReady => _controller != null;
+
   /// Centers the camera on the current GPS position.
   Future<void> goToGps() => _goToGps();
 
@@ -628,6 +651,9 @@ class MapScreenState extends State<MapScreen> {
     var h = maps.length * 31 + 7;
     for (final m in maps) {
       h = h * 31 + m.id.hashCode + (m.visible ? 1 : 0);
+    }
+    for (final d in _scope.library.dxfImports) {
+      h = h * 31 + d.id.hashCode + (d.visible ? 1 : 0);
     }
     return h;
   }
@@ -638,6 +664,7 @@ class MapScreenState extends State<MapScreen> {
       isScrollControlled: true,
       builder: (ctx) => _LayersSheet(
         maps: _scope.library.maps,
+        dxfs: _scope.library.dxfImports,
         showGrid: _scope.settings.showUtmGrid,
         onStateChanged: (m) async {
           await _scope.library.save();
@@ -652,6 +679,12 @@ class MapScreenState extends State<MapScreen> {
         onZoom: (m) {
           Navigator.pop(ctx);
           _zoomToMap(m);
+        },
+        onDxfChanged: (d) => onDxfImportChanged(d),
+        onDxfCadLayer: (d, layer, v) => onDxfCadLayerChanged(d, layer, v),
+        onDxfZoom: (d) {
+          Navigator.pop(ctx);
+          _zoomToDxf(d);
         },
       ),
     );
@@ -941,6 +974,310 @@ class MapScreenState extends State<MapScreen> {
     await _redrawGrid();
     await _redrawFieldData();
   }
+
+  // ---------------------------------------------------------- DXF overlays
+  // One GeoJSON source per visible DXF import; per-color line/fill/circle
+  // layers selected by filters, plus one symbol layer for TEXT labels.
+  // The source holds only the features of currently-visible CAD layers,
+  // so a CAD-layer toggle is a single setGeoJsonSource rewrite.
+  // DXF layers sit below the annotation stack (above PDF rasters) so
+  // waypoints/measurements/track stay on top.
+
+  static String _dxfSourceId(String id) => 'patok_src_dxf_$id';
+  static String _dxfFillId(String id, int ci) =>
+      'patok_lyr_dxf_${id}_fill_$ci';
+  static String _dxfLineId(String id, int ci) =>
+      'patok_lyr_dxf_${id}_line_$ci';
+  static String _dxfPointId(String id, int ci) =>
+      'patok_lyr_dxf_${id}_pt_$ci';
+  static String _dxfLabelId(String id) => 'patok_lyr_dxf_${id}_label';
+
+  final Map<String, _DxfOverlay> _dxfOverlays = {};
+
+  /// Reconciles DXF overlays with library visibility: adds newly visible
+  /// imports, drops hidden/removed ones. Style reloads clear everything
+  /// (sources die with the style), so this also re-adds after reload.
+  Future<void> _refreshDxfOverlays() async {
+    final c = _controller;
+    if (c == null || !_annLayersReady) return;
+    final want = <String, DxfImport>{
+      for (final d in _scope.library.dxfImports)
+        if (d.visible) d.id: d,
+    };
+    for (final id in _dxfOverlays.keys.toList()) {
+      if (!want.containsKey(id)) await _removeDxfOverlay(id);
+    }
+    for (final entry in want.entries) {
+      final existing = _dxfOverlays[entry.key];
+      if (existing == null) {
+        await _addDxfOverlay(entry.value);
+      } else if (!identical(existing.imp, entry.value)) {
+        // Same id, new model object (e.g. after a library reload):
+        // point at the new one and refresh its data.
+        existing.imp = entry.value;
+        await _updateDxfData(entry.key);
+      }
+    }
+  }
+
+  Future<void> _addDxfOverlay(DxfImport imp) async {
+    final c = _controller;
+    if (c == null) return;
+    final st = _DxfOverlay(imp);
+    try {
+      st.features = await readDxfCache(_scope.library.dxfCachePath(imp));
+    } catch (e) {
+      debugPrint('Patok: DXF cache unreadable for ${imp.id}: $e');
+      return;
+    }
+    final colorSet = <String>{};
+    for (final feats in st.features.values) {
+      for (final f in feats) {
+        final props = f['properties'] as Map;
+        if (props['kind'] != 'label') {
+          colorSet.add(props['color'] as String);
+        }
+      }
+    }
+    st.colors = colorSet.toList()..sort();
+    final sid = _dxfSourceId(imp.id);
+    try {
+      await c.addGeoJsonSource(sid, _dxfSourceData(st));
+    } catch (e) {
+      debugPrint('Patok: DXF source failed for ${imp.id}: $e');
+      return;
+    }
+    // Register before adding layers so a mid-add failure still cleans up.
+    _dxfOverlays[imp.id] = st;
+    try {
+      // Each layer goes directly below the annotation stack: later adds
+      // end up above earlier ones, so add fills first, labels last.
+      for (var i = 0; i < st.colors.length; i++) {
+        final color = st.colors[i];
+        await c.addFillLayer(
+          sid,
+          _dxfFillId(imp.id, i),
+          FillLayerProperties(
+            fillColor: color,
+            fillOpacity: 0.35 * imp.opacity,
+          ),
+          belowLayerId: _lyrGrid,
+          filter: _dxfFilter('fill', color),
+        );
+        st.layerIds.add(_dxfFillId(imp.id, i));
+      }
+      for (var i = 0; i < st.colors.length; i++) {
+        final color = st.colors[i];
+        await c.addLineLayer(
+          sid,
+          _dxfLineId(imp.id, i),
+          LineLayerProperties(lineColor: color, lineWidth: 2.0),
+          belowLayerId: _lyrGrid,
+          filter: _dxfFilter('line', color),
+        );
+        st.layerIds.add(_dxfLineId(imp.id, i));
+      }
+      for (var i = 0; i < st.colors.length; i++) {
+        final color = st.colors[i];
+        await c.addCircleLayer(
+          sid,
+          _dxfPointId(imp.id, i),
+          CircleLayerProperties(
+            circleColor: color,
+            circleRadius: 5.0,
+            circleStrokeWidth: 1.5,
+            circleStrokeColor: '#000000',
+          ),
+          belowLayerId: _lyrGrid,
+          filter: _dxfFilter('point', color),
+        );
+        st.layerIds.add(_dxfPointId(imp.id, i));
+      }
+      await c.addSymbolLayer(
+        sid,
+        _dxfLabelId(imp.id),
+        const SymbolLayerProperties(
+          textField: '{text}',
+          textSize: 12.0,
+          textColor: '#FFFFFF',
+          textHaloColor: '#000000',
+          textHaloWidth: 1.5,
+        ),
+        belowLayerId: _lyrGrid,
+        filter: _dxfFilter('label', null),
+      );
+      st.layerIds.add(_dxfLabelId(imp.id));
+    } catch (e) {
+      debugPrint('Patok: adding DXF overlay failed: $e');
+      await _removeDxfOverlay(imp.id);
+    }
+  }
+
+  static List<dynamic> _dxfFilter(String kind, String? color) => [
+        'all',
+        [
+          '==',
+          ['get', 'kind'],
+          kind,
+        ],
+        if (color != null)
+          [
+            '==',
+            ['get', 'color'],
+            color,
+          ],
+      ];
+
+  /// Source data: features of the CAD layers currently toggled on.
+  Map<String, dynamic> _dxfSourceData(_DxfOverlay st) => {
+        'type': 'FeatureCollection',
+        'features': [
+          for (final entry in st.features.entries)
+            if (st.imp.cadLayers[entry.key] ?? true) ...entry.value,
+        ],
+      };
+
+  Future<void> _removeDxfOverlay(String id) async {
+    final c = _controller;
+    final st = _dxfOverlays.remove(id);
+    if (c == null || st == null) return;
+    for (final lid in st.layerIds) {
+      try {
+        await c.removeLayer(lid);
+      } catch (_) {}
+    }
+    try {
+      await c.removeSource(_dxfSourceId(id));
+    } catch (_) {}
+  }
+
+  /// Rewrites one import's source after CAD-layer toggles.
+  Future<void> _updateDxfData(String id) async {
+    final c = _controller;
+    final st = _dxfOverlays[id];
+    if (c == null || st == null) return;
+    try {
+      await c.setGeoJsonSource(_dxfSourceId(id), _dxfSourceData(st));
+    } catch (e) {
+      debugPrint('Patok: DXF data update failed: $e');
+    }
+  }
+
+  /// Applies a DXF import's opacity to its layers.
+  Future<void> _applyDxfOpacity(DxfImport imp) async {
+    final c = _controller;
+    final st = _dxfOverlays[imp.id];
+    if (c == null || st == null) return;
+    try {
+      for (var i = 0; i < st.colors.length; i++) {
+        await c.setLayerProperties(
+          _dxfFillId(imp.id, i),
+          FillLayerProperties(fillOpacity: 0.35 * imp.opacity),
+        );
+        await c.setLayerProperties(
+          _dxfLineId(imp.id, i),
+          LineLayerProperties(lineOpacity: imp.opacity),
+        );
+        await c.setLayerProperties(
+          _dxfPointId(imp.id, i),
+          CircleLayerProperties(circleOpacity: imp.opacity),
+        );
+      }
+      await c.setLayerProperties(
+        _dxfLabelId(imp.id),
+        SymbolLayerProperties(textOpacity: imp.opacity),
+      );
+    } catch (e) {
+      debugPrint('Patok: DXF opacity failed: $e');
+    }
+  }
+
+  /// Zooms the camera to a DXF import's bounds.
+  Future<void> _zoomToDxf(DxfImport imp) async {
+    final c = _controller;
+    if (c == null || imp.bounds.length != 4) return;
+    final b = imp.bounds;
+    await c.animateCamera(
+      CameraUpdate.newLatLngBounds(
+        LatLngBounds(
+          southwest: LatLng(b[1], b[0]),
+          northeast: LatLng(b[3], b[2]),
+        ),
+        left: 24,
+        top: 24,
+        right: 24,
+        bottom: 24,
+      ),
+    );
+  }
+
+  /// Called by the layers sheet when a CAD layer is toggled.
+  Future<void> onDxfCadLayerChanged(
+    DxfImport imp,
+    String cadLayer,
+    bool visible,
+  ) async {
+    imp.cadLayers[cadLayer] = visible;
+    await _scope.library.save();
+    await _updateDxfData(imp.id);
+  }
+
+  /// Called by the layers sheet for import-level visibility/opacity.
+  Future<void> onDxfImportChanged(DxfImport imp) async {
+    await _scope.library.save();
+    if (imp.visible && !_dxfOverlays.containsKey(imp.id)) {
+      await _addDxfOverlay(imp);
+    } else if (!imp.visible) {
+      await _removeDxfOverlay(imp.id);
+    } else {
+      await _applyDxfOpacity(imp);
+    }
+    if (mounted) setState(() {});
+  }
+
+  // ---------------------------------------------------------- point picking
+  // One-shot crosshair picker for cross-tab flows (DXF grid calibration).
+  // The caller (via HomeScreen) switches to the Map tab, awaits pickPoint(),
+  // and navigates back when it completes.
+
+  Completer<LatLng?>? _pickCompleter;
+  String _pickPrompt = '';
+
+  bool get _picking => _pickCompleter != null;
+
+  /// Whether a one-shot pick is currently active.
+  bool get isPicking => _picking;
+
+  /// Cancels an active pick (completes with null). Called when the user
+  /// navigates away from the Map tab mid-pick.
+
+  /// Shows the crosshair with a confirm bar; completes with the
+  /// screen-center LatLng, or null if cancelled, already picking, or the
+  /// map isn't ready.
+  Future<LatLng?> pickPoint({String prompt = 'Pick a point'}) {
+    if (_pickCompleter != null || _controller == null) {
+      return Future.value(null);
+    }
+    _pickCompleter = Completer<LatLng?>();
+    setState(() => _pickPrompt = prompt);
+    return _pickCompleter!.future;
+  }
+
+  Future<void> _confirmPick() async {
+    final pt = await _mapCenter();
+    _pickCompleter?.complete(pt);
+    _pickCompleter = null;
+    if (mounted) setState(() {});
+  }
+
+  void _cancelPick() {
+    _pickCompleter?.complete(null);
+    _pickCompleter = null;
+    if (mounted) setState(() {});
+  }
+
+  /// Public cancel for cross-tab flows (see [isPicking]).
+  void cancelPick() => _cancelPick();
 
   /// UTM grid line coordinates ([lon, lat] pairs) for the visible region.
   /// Line spacing follows the visible width. Returns empty when the region
@@ -1506,8 +1843,8 @@ class MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
-          // Crosshair placement mode.
-          if (_precisionMode)
+          // Crosshair placement mode (precision mode or one-shot picker).
+          if (_precisionMode || _picking)
             const IgnorePointer(
               child: Center(child: _Crosshair()),
             ),
@@ -1673,6 +2010,45 @@ class MapScreenState extends State<MapScreen> {
             ),
           ),
           // Bottom: scale bar + measure panel or coordinate readout.
+          // One-shot point picker bar (sits above the bottom bar).
+          if (_picking)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 108,
+              child: SafeArea(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: PatokTheme.surface.withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _pickPrompt,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _cancelPick,
+                        child: const Text('Cancel'),
+                      ),
+                      const SizedBox(width: 4),
+                      FilledButton.icon(
+                        onPressed: _confirmPick,
+                        icon: const Icon(Icons.check),
+                        label: const Text('Pick'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           Align(
             alignment: Alignment.bottomCenter,
             child: SafeArea(
@@ -1846,6 +2222,23 @@ class _GpsBarState extends State<_GpsBar> {
     if (age.inHours < 1) return '${age.inMinutes}m ago';
     return '${age.inHours}h ago';
   }
+}
+
+/// Live state for one DXF import's map overlay.
+class _DxfOverlay {
+  _DxfOverlay(this.imp);
+
+  /// The library entry (replaced if the model object is reloaded).
+  DxfImport imp;
+
+  /// All CAD layers -> their GeoJSON features (unfiltered).
+  Map<String, List<Map<String, dynamic>>> features = {};
+
+  /// Distinct non-label colors, sorted; index selects the layer suffix.
+  List<String> colors = [];
+
+  /// MapLibre layer ids created for this import (for removal).
+  final List<String> layerIds = [];
 }
 
 /// Dynamic scale bar: picks a nice round distance for ~90px at the
@@ -2087,16 +2480,24 @@ class _MeasurePanel extends StatelessWidget {
 class _LayersSheet extends StatefulWidget {
   const _LayersSheet({
     required this.maps,
+    required this.dxfs,
     required this.showGrid,
     required this.onStateChanged,
     required this.onGridChanged,
     required this.onZoom,
+    required this.onDxfChanged,
+    required this.onDxfCadLayer,
+    required this.onDxfZoom,
   });
   final List<GeoMap> maps;
+  final List<DxfImport> dxfs;
   final bool showGrid;
   final Future<void> Function(GeoMap) onStateChanged;
   final Future<void> Function(bool) onGridChanged;
   final void Function(GeoMap) onZoom;
+  final Future<void> Function(DxfImport) onDxfChanged;
+  final Future<void> Function(DxfImport, String, bool) onDxfCadLayer;
+  final void Function(DxfImport) onDxfZoom;
 
   @override
   State<_LayersSheet> createState() => _LayersSheetState();
@@ -2228,12 +2629,98 @@ class _LayersSheetState extends State<_LayersSheet> {
                   },
                 ),
               ),
+            if (widget.dxfs.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                'DXF overlays',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: widget.dxfs.length,
+                  itemBuilder: (_, i) {
+                    final d = widget.dxfs[i];
+                    final layers = d.cadLayers.keys.toList()..sort();
+                    return Card(
+                      child: ExpansionTile(
+                        leading: const Icon(Icons.polyline),
+                        title: Text(d.name),
+                        subtitle: Text(
+                          '${layers.length} CAD layer(s) • ${_crsLabel(d.crs)}',
+                        ),
+                        trailing: Switch(
+                          value: d.visible,
+                          onChanged: (v) async {
+                            setState(() => d.visible = v);
+                            await widget.onDxfChanged(d);
+                          },
+                        ),
+                        children: [
+                          Row(
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.center_focus_strong),
+                                tooltip: 'Zoom to drawing',
+                                onPressed: () => widget.onDxfZoom(d),
+                              ),
+                              const Icon(
+                                Icons.opacity,
+                                size: 18,
+                                color: PatokTheme.onSurfaceDim,
+                              ),
+                              Expanded(
+                                child: Slider(
+                                  value: d.opacity,
+                                  onChanged: (v) =>
+                                      setState(() => d.opacity = v),
+                                  onChangeEnd: (_) =>
+                                      widget.onDxfChanged(d),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 48,
+                                child: Text(
+                                  '${(d.opacity * 100).round()}%',
+                                  style:
+                                      Theme.of(context).textTheme.bodySmall,
+                                ),
+                              ),
+                            ],
+                          ),
+                          for (final layer in layers)
+                            SwitchListTile(
+                              dense: true,
+                              title: Text(
+                                layer,
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                              value: d.cadLayers[layer] ?? true,
+                              onChanged: (v) async {
+                                setState(() => d.cadLayers[layer] = v);
+                                await widget.onDxfCadLayer(d, layer, v);
+                              },
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
 }
+
+String _crsLabel(DxfCrs crs) => switch (crs) {
+      DxfUtm(:var zone, :var southernHemisphere) =>
+        'UTM $zone${southernHemisphere ? 'S' : 'N'}',
+      DxfLocalGrid(:var name) => 'Grid: $name',
+    };
 
 /// A high-detail re-render request for one visible page region.
 class _DetailTarget {
