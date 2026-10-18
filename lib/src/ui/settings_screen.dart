@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
 
+import '../theme.dart';
+import '../update_service.dart';
 import 'app_scope.dart';
+import 'update_sheet.dart';
 
-/// App settings: sunlight mode, render DPI, coordinate format, about.
+/// App settings: sunlight mode, render DPI, coordinate format, updates,
+/// about.
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -11,6 +15,45 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  bool _checking = false;
+  bool _autoCheck = true;
+  String? _version;
+
+  @override
+  void initState() {
+    super.initState();
+    installedVersion().then((v) {
+      if (mounted) setState(() => _version = v);
+    });
+    autoCheckUpdate.then((v) {
+      if (mounted) setState(() => _autoCheck = v);
+    });
+  }
+
+  Future<void> _checkForUpdates() async {
+    setState(() => _checking = true);
+    try {
+      final info = await checkForUpdate();
+      if (!mounted) return;
+      if (info != null) {
+        await showUpdateSheet(context, info);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("You're up to date.")),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text(
+                  "Couldn't check for updates. Check your connection.")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _checking = false);
+    }
+  }
   @override
   Widget build(BuildContext context) {
     final settings = AppScope.of(context).settings;
@@ -106,19 +149,56 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 8),
+          _SectionTitle('Updates'),
+          Card(
+            child: Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.system_update_outlined,
+                      color: PatokTheme.accent),
+                  title: const Text('Check for updates'),
+                  subtitle:
+                      const Text('See if a newer version is available'),
+                  trailing: _checking
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child:
+                              CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.chevron_right),
+                  onTap: _checking ? null : _checkForUpdates,
+                ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  secondary: const Icon(Icons.autorenew_outlined,
+                      color: PatokTheme.accent),
+                  title: const Text('Auto-check for updates'),
+                  subtitle: const Text(
+                      'Check once a day when the app starts'),
+                  value: _autoCheck,
+                  onChanged: (v) async {
+                    await setAutoCheckUpdate(v);
+                    if (mounted) setState(() => _autoCheck = v);
+                  },
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
           _SectionTitle('About'),
-          const Card(
+          Card(
             child: Padding(
-              padding: EdgeInsets.all(16),
+              padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Patok 1.0.2',
-                    style: TextStyle(fontWeight: FontWeight.w600),
+                    'Patok ${_version ?? ''}',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
                   ),
-                  SizedBox(height: 8),
-                  Text(
+                  const SizedBox(height: 8),
+                  const Text(
                     'Offline georeferenced map reader for Android.\n'
                     'Reads OGC georegistration (/VP /Measure) and '
                     'TerraGo (/LGIDict) PDFs. Maps render with PDFium; '

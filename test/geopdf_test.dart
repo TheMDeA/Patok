@@ -404,4 +404,42 @@ void main() {
       expect(p.y, -2.1);
     });
   });
+
+  group('polygonAreaSqMeters', () {
+    test('1x1 degree square at equator ~ 12,364 km²', () {
+      final area = polygonAreaSqMeters([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+      ]);
+      // (111.32km)² ≈ 12392 km²; equirectangular slightly under.
+      expect(area, greaterThan(12.2e9));
+      expect(area, lessThan(12.6e9));
+    });
+
+    test('100m x 100m square', () {
+      // 0.0008983° ≈ 100m at equator.
+      const d = 0.0008983;
+      final area = polygonAreaSqMeters([
+        [115.5, -2.1],
+        [115.5 + d, -2.1],
+        [115.5 + d, -2.1 + d],
+        [115.5, -2.1 + d],
+      ]);
+      expect(area, greaterThan(9900));
+      expect(area, lessThan(10100));
+    });
+
+    test('degenerate input returns 0', () {
+      expect(polygonAreaSqMeters([]), 0);
+      expect(
+        polygonAreaSqMeters([
+          [1.0, 2.0],
+          [3.0, 4.0],
+        ]),
+        0,
+      );
+    });
+  });
 }

@@ -12,12 +12,19 @@ and concise.
   past a zoom threshold (toggle in Settings)
 - GPS status bar under the coordinates: elevation, horizontal/vertical
   accuracy, live satellite count, speed, and fix age, with a copy button
+- Area measurement: the measure tool now shows polygon area (m²/ha)
+  with a filled preview, saved with the measurement
+- Dynamic scale bar on the map
+- In-app update checker: check for updates in Settings, with optional
+  daily auto-check and one-tap APK download/install
 
 ### Fixed
 - Waypoints and saved measurements now appear on the map (map
   overlays no longer draw over them)
 - Bottom coordinate bar now shows your GPS position instead of the map
   center (it could show a stale default location)
+- Added the missing INTERNET permission (release builds need it for
+  map tiles and the update checker)
 
 ## [1.0.1] - 2026-10-15
 

@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../models.dart';
 import '../theme.dart';
+import '../update_service.dart';
 import 'field_screen.dart';
 import 'library_screen.dart';
 import 'map_screen.dart';
+import 'update_sheet.dart';
 
 /// App shell: bottom navigation (Map | Library | Field) like the approved
 /// mockup. Opens on the Library tab so the app doesn't dump the user
@@ -23,6 +25,27 @@ class _HomeScreenState extends State<HomeScreen> {
   final _mapKey = GlobalKey<MapScreenState>();
 
   MapScreenState? get _mapState => _mapKey.currentState;
+
+  @override
+  void initState() {
+    super.initState();
+    // Daily update check, after the first frame. Surfaces as a snackbar —
+    // never a blocking dialog.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final info = await maybeAutoCheckUpdate();
+      if (!mounted || info == null) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Update available: Patok ${info.version}'),
+          action: SnackBarAction(
+            label: 'View',
+            onPressed: () => showUpdateSheet(context, info),
+          ),
+          duration: const Duration(seconds: 8),
+        ),
+      );
+    });
+  }
 
   void _openMap(GeoMap map) {
     setState(() => _index = 0);

@@ -321,7 +321,8 @@ class _FieldScreenState extends State<FieldScreen> {
                               color: PatokTheme.accent),
                           title: Text(m.name),
                           subtitle: Text(
-                              '${_fmtLen(m.lengthMeters)} • ${m.points.length} points'),
+                              '${_fmtLen(m.lengthMeters)} • ${m.points.length} points'
+                              '${m.areaSqMeters != null ? ' • ${_fmtArea(m.areaSqMeters!)}' : ''}'),
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () async {
@@ -344,6 +345,10 @@ class _FieldScreenState extends State<FieldScreen> {
   String _fmtLen(double m) => m < 1000
       ? '${m.toStringAsFixed(1)} m'
       : '${(m / 1000).toStringAsFixed(2)} km';
+
+  String _fmtArea(double sqm) => sqm < 10000
+      ? '${sqm.toStringAsFixed(0)} m²'
+      : '${(sqm / 10000).toStringAsFixed(2)} ha';
 }
 
 class _SectionHeader extends StatelessWidget {

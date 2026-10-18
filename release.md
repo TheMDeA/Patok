@@ -10,6 +10,11 @@ redesigned following the approved mockup — plus import and rendering fixes.
   count, speed, and fix age under the coordinates, with a copy button
 - Bottom coordinate bar now shows your GPS position instead of the map
   center
+- In-app update checker in Settings, with optional daily auto-check
+  and one-tap APK download/install
+- Area measurement: the measure tool shows polygon area (m²/ha) with
+  a filled preview, saved with the measurement
+- Dynamic scale bar on the map
 - Bottom navigation (Map | Library | Field); the app now opens on the
   Library instead of the map
 - Map library redesigned: search, "Bring your own map" import card,

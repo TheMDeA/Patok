@@ -458,3 +458,28 @@ String formatUtm(double lon, double lat) {
     return '${lat.toStringAsFixed(5)}, ${lon.toStringAsFixed(5)}';
   }
 }
+
+/// Geodesic polygon area in square meters for (lon, lat) vertices.
+/// Equirectangular projection around the centroid + shoelace — accurate
+/// well beyond field-measurement sizes. Returns 0 for < 3 vertices.
+double polygonAreaSqMeters(List<List<double>> lonLat) {
+  if (lonLat.length < 3) return 0;
+  var latSum = 0.0;
+  for (final p in lonLat) {
+    latSum += p[1];
+  }
+  final cosLat = math.cos(latSum / lonLat.length * math.pi / 180);
+  const r = 6371000.0;
+  const k = math.pi / 180;
+  var area = 0.0;
+  for (var i = 0; i < lonLat.length; i++) {
+    final p1 = lonLat[i];
+    final p2 = lonLat[(i + 1) % lonLat.length];
+    final x1 = r * p1[0] * k * cosLat;
+    final y1 = r * p1[1] * k;
+    final x2 = r * p2[0] * k * cosLat;
+    final y2 = r * p2[1] * k;
+    area += x1 * y2 - x2 * y1;
+  }
+  return area.abs() / 2;
+}
