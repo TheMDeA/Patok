@@ -1,8 +1,11 @@
 # Patok v1.0.5
 
-Follow-me GPS tracking, a recording indicator, and friendlier editing.
+Follow-me GPS tracking, DXF mine plan overlays, and friendlier editing.
 
 ## What's new
+- DXF drawing import: overlay mine plan DXFs using UTM or a local mine
+  grid calibrated from two reference points (GPS, map pick, or lat/lon),
+  with per-CAD-layer toggles in the layers sheet
 - Follow-me mode: the GPS button now keeps the map centered on your
   position while you move; tap again or pan manually to stop
 - Reset-north button: snaps the map rotation back to north-up

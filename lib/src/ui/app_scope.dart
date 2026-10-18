@@ -1,5 +1,6 @@
 import 'package:flutter/widgets.dart';
 
+import '../dxf/dxf_crs.dart';
 import '../services.dart';
 
 /// Simple service locator for the app's singletons.
@@ -15,6 +16,7 @@ class AppScope extends InheritedWidget {
     required this.trackRecorder,
     required this.settings,
     required this.fieldData,
+    required this.localGrids,
     required super.child,
   });
 
@@ -27,6 +29,7 @@ class AppScope extends InheritedWidget {
   final TrackRecorder trackRecorder;
   final SettingsService settings;
   final FieldDataStore fieldData;
+  final DxfLocalGridStore localGrids;
 
   static AppScope of(BuildContext context) {
     final scope = context.dependOnInheritedWidgetOfExactType<AppScope>();

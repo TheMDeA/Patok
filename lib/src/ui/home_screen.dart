@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../dxf/dxf_import.dart';
 import '../models.dart';
 import '../share_intent_service.dart';
 import '../theme.dart';
@@ -92,6 +93,27 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  void _openDxf(DxfImport imp) {
+    setState(() => _index = 0);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _mapState?.openDxf(imp);
+    });
+  }
+
+  /// Map-tab point picker for DXF grid calibration: switches to the Map
+  /// tab, waits for the native map, and completes with the picked
+  /// position (or null if cancelled / unavailable).
+  Future<({double lon, double lat})?> _pickPointOnMap(String prompt) async {
+    _onTab(0);
+    for (var i = 0; i < 50; i++) {
+      if (_mapState?.isMapReady ?? false) break;
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+    final pt = await _mapState?.pickPoint(prompt: prompt);
+    if (pt == null) return null;
+    return (lon: pt.longitude, lat: pt.latitude);
+  }
+
   void _goToGps() {
     setState(() => _index = 0);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -109,6 +131,11 @@ class _HomeScreenState extends State<HomeScreen> {
   void _goToLibrary() => setState(() => _index = 1);
 
   void _onTab(int i) {
+    // A tab switch away from the map cancels an active point pick so the
+    // caller (DXF grid calibration) never hangs.
+    if (i != 0 && (_mapState?.isPicking ?? false)) {
+      _mapState?.cancelPick();
+    }
     setState(() => _index = i);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (i == 0) {
@@ -127,7 +154,11 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           MapScreen(
               key: _mapKey, onBrowseMaps: _goToLibrary, onOpenField: () => _onTab(2)),
-          LibraryScreen(onOpenMap: _openMap),
+          LibraryScreen(
+            onOpenMap: _openMap,
+            onOpenDxf: _openDxf,
+            onPickPointOnMap: _pickPointOnMap,
+          ),
           FieldScreen(
             key: _fieldKey,
             onGoToGps: _goToGps,

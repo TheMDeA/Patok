@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+
 import 'src/services.dart';
 import 'src/theme.dart';
 import 'src/ui/app_scope.dart';
@@ -17,6 +18,7 @@ Future<void> main() async {
   final gnssService = GnssService()..start();
   final trackRecorder = TrackRecorder(locationService);
   final fieldData = await FieldDataStore.load();
+  final localGrids = await library.dxfLocalGrids();
 
   // Edge-to-edge for the full-bleed map.
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -32,6 +34,7 @@ Future<void> main() async {
       trackRecorder: trackRecorder,
       settings: settings,
       fieldData: fieldData,
+      localGrids: localGrids,
       child: PatokApp(settings: settings),
     ),
   );

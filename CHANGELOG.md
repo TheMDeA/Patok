@@ -3,11 +3,13 @@
 All notable changes to Patok are documented here. Entries are user-facing
 and concise.
 
-## [Unreleased]
-
 ## [1.0.5] - 2026-10-18
 
 ### Added
+- DXF drawing import: bring in mine plan DXFs using UTM coordinates or
+  a named local mine grid calibrated from two reference points (GPS,
+  map pick, or lat/lon); drawings render as vector overlays with
+  per-CAD-layer toggles in the layers sheet and TEXT labels
 - Follow-me mode: the GPS button now keeps the map centered on your
   position while you move; tap again or pan manually to stop
 - Reset-north button: snaps the map rotation back to north-up
