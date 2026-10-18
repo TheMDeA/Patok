@@ -3,6 +3,13 @@
 All notable changes to Patok are documented here. Entries are user-facing
 and concise.
 
+## [1.0.6] - 2026-10-18
+
+### Fixed
+- DXF drawings with many entities now appear on the map (large drawings
+  are split into chunks that fit the map channel); a drawing that still
+  fails to display now shows a message instead of failing silently
+
 ## [1.0.5] - 2026-10-18
 
 ### Added

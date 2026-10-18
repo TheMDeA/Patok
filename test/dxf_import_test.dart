@@ -118,6 +118,17 @@ EOF
   return (p.x, p.y);
 }
 
+Map<String, dynamic> _lineFeature(int nPts, String color) => {
+      'type': 'Feature',
+      'geometry': {
+        'type': 'LineString',
+        'coordinates': [
+          for (var i = 0; i < nPts; i++) [115.0 + i * 0.001, -2.0],
+        ],
+      },
+      'properties': {'color': color, 'kind': 'line'},
+    };
+
 void main() {
   test('entities become lon/lat features grouped by CAD layer', () {
     final doc = parseDxf(_dxf);
@@ -200,5 +211,51 @@ void main() {
     buildDxfFeatures(doc, DxfUtm(zone: 50, southernHemisphere: true), [],
         onProgress: (_, _) => calls++);
     expect(calls, greaterThan(0));
+  });
+
+  group('chunkDxfFeatures', () {
+    test('small input stays in one chunk', () {
+      final byLayer = {
+        'PIT': [_lineFeature(10, '#FF0000'), _lineFeature(5, '#00FF00')],
+      };
+      final chunks = chunkDxfFeatures(byLayer);
+      expect(chunks, hasLength(1));
+      expect(chunks.single['PIT'], hasLength(2));
+    });
+
+    test('splits large input into bounded chunks without losing features',
+        () {
+      final byLayer = {
+        'PIT': [for (var i = 0; i < 20; i++) _lineFeature(500, '#FF0000')],
+        'ROADS': [for (var i = 0; i < 20; i++) _lineFeature(500, '#00FF00')],
+      };
+      final chunks = chunkDxfFeatures(byLayer, maxBytes: 32 * 1024);
+      expect(chunks.length, greaterThan(1));
+      var total = 0;
+      for (final c in chunks) {
+        var bytes = 0;
+        for (final feats in c.values) {
+          for (final f in feats) {
+            bytes += estimateFeatureBytes(f);
+            total++;
+          }
+        }
+        expect(bytes, lessThanOrEqualTo(32 * 1024 + 24 * 500 + 150));
+      }
+      expect(total, 40);
+    });
+
+    test('deterministic chunking', () {
+      final byLayer = {
+        'B': [for (var i = 0; i < 30; i++) _lineFeature(200, '#FF0000')],
+        'A': [for (var i = 0; i < 30; i++) _lineFeature(200, '#00FF00')],
+      };
+      final a = chunkDxfFeatures(byLayer, maxBytes: 16 * 1024);
+      final b = chunkDxfFeatures(byLayer, maxBytes: 16 * 1024);
+      expect(a.length, b.length);
+      for (var i = 0; i < a.length; i++) {
+        expect(a[i].keys.toSet(), b[i].keys.toSet());
+      }
+    });
   });
 }

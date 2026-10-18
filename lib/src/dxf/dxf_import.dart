@@ -256,3 +256,50 @@ Future<Map<String, List<Map<String, dynamic>>>> readDxfCache(
         (v as List).map((e) => e as Map<String, dynamic>).toList(),
       ));
 }
+
+/// Splits an import's features into chunks that each stay comfortably
+/// under the ~1MB Android method-channel limit when serialized as
+/// GeoJSON (one map source per chunk). Deterministic: the same cache
+/// always chunks the same way.
+List<Map<String, List<Map<String, dynamic>>>> chunkDxfFeatures(
+  Map<String, List<Map<String, dynamic>>> byCadLayer, {
+  int maxBytes = 400 * 1024,
+}) {
+  final chunks = <Map<String, List<Map<String, dynamic>>>>[];
+  var cur = <String, List<Map<String, dynamic>>>{};
+  var curBytes = 0;
+  void flush() {
+    if (cur.isEmpty) return;
+    chunks.add(cur);
+    cur = <String, List<Map<String, dynamic>>>{};
+    curBytes = 0;
+  }
+
+  final layers = byCadLayer.keys.toList()..sort();
+  for (final layer in layers) {
+    for (final f in byCadLayer[layer]!) {
+      final est = estimateFeatureBytes(f);
+      if (curBytes + est > maxBytes && curBytes > 0) flush();
+      (cur[layer] ??= []).add(f);
+      curBytes += est;
+    }
+  }
+  flush();
+  return chunks;
+}
+
+/// Cheap size estimate for one GeoJSON feature: coordinates dominate.
+int estimateFeatureBytes(Map<String, dynamic> f) =>
+    24 * _coordCount((f['geometry'] as Map)['coordinates']) + 150;
+
+int _coordCount(dynamic coords) {
+  if (coords is num) return 1;
+  if (coords is List) {
+    var n = 0;
+    for (final c in coords) {
+      n += _coordCount(c);
+    }
+    return n;
+  }
+  return 0;
+}
