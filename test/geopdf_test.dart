@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:patok/src/geopdf/georef.dart';
+import 'package:patok/src/models.dart';
 import 'package:patok/src/geopdf/pdf_model.dart';
 import 'package:patok/src/geopdf/pdf_parser.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -29,7 +30,8 @@ Uint8List buildPdf(List<String> objects) {
   return Uint8List.fromList(buf);
 }
 
-const _wgs84Utm50sWkt = 'PROJCS["WGS 84 / UTM zone 50S",'
+const _wgs84Utm50sWkt =
+    'PROJCS["WGS 84 / UTM zone 50S",'
     'GEOGCS["WGS 84",DATUM["WGS_1984",'
     'SPHEROID["WGS 84",6378137,298.257223563]],'
     'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],'
@@ -81,8 +83,9 @@ void main() {
       final obj6 = '[1 2 3]';
       final off2 = obj5.length + 1; // + newline separator
       final header = '5 0\n6 $off2\n';
-      final objStmData =
-          Uint8List.fromList(ascii.encode('$header$obj5\n$obj6'));
+      final objStmData = Uint8List.fromList(
+        ascii.encode('$header$obj5\n$obj6'),
+      );
       final objStmCompressed = ZLibCodec().encode(objStmData);
 
       final buf = <int>[];
@@ -101,9 +104,11 @@ void main() {
       }
       // object 4: ObjStm
       final stm4Offset = buf.length;
-      write('4 0 obj\n<< /Type /ObjStm /N 2 /First ${header.length} '
-          '/Length ${objStmCompressed.length} /Filter /FlateDecode >>\n'
-          'stream\n');
+      write(
+        '4 0 obj\n<< /Type /ObjStm /N 2 /First ${header.length} '
+        '/Length ${objStmCompressed.length} /Filter /FlateDecode >>\n'
+        'stream\n',
+      );
       buf.addAll(objStmCompressed);
       write('\nendstream\nendobj\n');
       // object 7: xref stream. Entries: 1..4 direct, 5..6 compressed in 4.
@@ -124,10 +129,12 @@ void main() {
       // (index 0 = free entry placeholder handled by /Index)
       final xrefOffset = buf.length;
       final xrefData = ZLibCodec().encode(Uint8List.fromList(entries));
-      write('7 0 obj\n<< /Type /XRef /Size 8 /Root 1 0 R '
-          '/W [1 2 2] /Index [1 6] '
-          '/Length ${xrefData.length} /Filter /FlateDecode >>\n'
-          'stream\n');
+      write(
+        '7 0 obj\n<< /Type /XRef /Size 8 /Root 1 0 R '
+        '/W [1 2 2] /Index [1 6] '
+        '/Length ${xrefData.length} /Filter /FlateDecode >>\n'
+        'stream\n',
+      );
       buf.addAll(xrefData);
       write('\nendstream\nendobj\n');
       write('startxref\n$xrefOffset\n%%EOF\n');
@@ -312,6 +319,89 @@ void main() {
     test('formatUtm produces a zone string', () {
       final s = formatUtm(106.8, -6.2);
       expect(s, contains('48S')); // lon 106.8E -> UTM zone 48S
+    });
+  });
+
+  group('detail render transforms', () {
+    // pixelToUserSpace and userToRotatedPx must be exact inverses for all
+    // /Rotate values: the detail overlay depends on it.
+    test('userToRotatedPx inverts pixelToUserSpace', () {
+      const pageW = 612.0, pageH = 792.0;
+      for (final rotation in [0, 90, 180, 270]) {
+        final rotW = (rotation == 90 || rotation == 270) ? pageH : pageW;
+        final rotH = (rotation == 90 || rotation == 270) ? pageW : pageH;
+        const scale = 2.5;
+        final fullW = rotW * scale, fullH = rotH * scale;
+        for (final u in [
+          [0.0, 0.0],
+          [pageW, pageH],
+          [pageW / 2, pageH / 3],
+          [123.4, 456.7],
+        ]) {
+          final px = userToRotatedPx(
+            u[0],
+            u[1],
+            scale: scale,
+            pageW: pageW,
+            pageH: pageH,
+            rotation: rotation,
+            fullH: fullH,
+          );
+          final back = pixelToUserSpace(
+            px: px.x,
+            py: px.y,
+            imgW: fullW,
+            imgH: fullH,
+            pageW: pageW,
+            pageH: pageH,
+            rotation: rotation,
+          );
+          expect(
+            (back.x - u[0]).abs() < 1e-9,
+            isTrue,
+            reason: 'rot=$rotation u=$u -> $back',
+          );
+          expect(
+            (back.y - u[1]).abs() < 1e-9,
+            isTrue,
+            reason: 'rot=$rotation u=$u -> $back',
+          );
+        }
+      }
+    });
+
+    test('inverseAffine inverts the page affine', () {
+      final g = PageGeoref(
+        pageIndex: 0,
+        pageWidthPt: 612,
+        pageHeightPt: 792,
+        rotation: 0,
+        kind: GeorefKind.ogc,
+        a: 0.001,
+        b: 0.0002,
+        c: 115.0,
+        d: -0.0001,
+        e: -0.0011,
+        f: -2.0,
+        srcIsLonLat: true,
+      );
+      for (final u in [
+        [0.0, 0.0],
+        [612.0, 792.0],
+        [300.5, 400.25],
+      ]) {
+        final sx = g.a * u[0] + g.b * u[1] + g.c;
+        final sy = g.d * u[0] + g.e * u[1] + g.f;
+        final back = inverseAffine(g, sx, sy);
+        expect((back.x - u[0]).abs() < 1e-9, isTrue);
+        expect((back.y - u[1]).abs() < 1e-9, isTrue);
+      }
+    });
+
+    test('toProjected falls back to identity without wkt', () {
+      final p = toProjected(115.5, -2.1, null);
+      expect(p.x, 115.5);
+      expect(p.y, -2.1);
     });
   });
 }

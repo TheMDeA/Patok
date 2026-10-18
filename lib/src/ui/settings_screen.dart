@@ -25,8 +25,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               children: [
                 SwitchListTile(
                   title: const Text('Sunlight mode'),
-                  subtitle: const Text(
-                      'Extra contrast for bright outdoor use'),
+                  subtitle: const Text('Extra contrast for bright outdoor use'),
                   value: settings.sunlightMode,
                   onChanged: (v) async {
                     await settings.setSunlightMode(v);
@@ -34,18 +33,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   },
                 ),
                 const Divider(height: 1),
+                SwitchListTile(
+                  title: const Text('Sharp text when zoomed in'),
+                  subtitle: const Text(
+                    'Re-render the visible area at high detail',
+                  ),
+                  value: settings.detailZoom,
+                  onChanged: (v) async {
+                    await settings.setDetailZoom(v);
+                    if (mounted) setState(() {});
+                  },
+                ),
+                const Divider(height: 1),
                 ListTile(
                   title: const Text('Coordinate format'),
-                  subtitle: Text(settings.coordFormat == 'utm'
-                      ? 'UTM (e.g. 48S 699163mE 9314349mN)'
-                      : 'Latitude / longitude'),
+                  subtitle: Text(
+                    settings.coordFormat == 'utm'
+                        ? 'UTM (e.g. 48S 699163mE 9314349mN)'
+                        : 'Latitude / longitude',
+                  ),
                   trailing: DropdownButton<String>(
                     value: settings.coordFormat,
                     items: const [
-                      DropdownMenuItem(
-                          value: 'utm', child: Text('UTM')),
-                      DropdownMenuItem(
-                          value: 'latlon', child: Text('Lat/Lon')),
+                      DropdownMenuItem(value: 'utm', child: Text('UTM')),
+                      DropdownMenuItem(value: 'latlon', child: Text('Lat/Lon')),
                     ],
                     onChanged: (v) async {
                       if (v == null) return;
@@ -65,26 +76,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ListTile(
                   title: const Text('Overlay render quality'),
                   subtitle: Text(
-                      '${settings.renderDpi.toStringAsFixed(0)} DPI — '
-                      'higher is sharper but slower'),
+                    '${settings.renderDpi.toStringAsFixed(0)} DPI — '
+                    'higher is sharper but slower',
+                  ),
                 ),
                 Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16),
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Row(
                     children: [96, 150, 300].map((dpi) {
-                      final selected =
-                          settings.renderDpi == dpi.toDouble();
+                      final selected = settings.renderDpi == dpi.toDouble();
                       return Expanded(
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 4),
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
                           child: ChoiceChip(
                             label: Text('$dpi'),
                             selected: selected,
                             onSelected: (_) async {
-                              await settings
-                                  .setRenderDpi(dpi.toDouble());
+                              await settings.setRenderDpi(dpi.toDouble());
                               if (mounted) setState(() {});
                             },
                           ),
@@ -105,8 +113,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Patok 1.0.2',
-                      style: TextStyle(fontWeight: FontWeight.w600)),
+                  Text(
+                    'Patok 1.0.2',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
                   SizedBox(height: 8),
                   Text(
                     'Offline georeferenced map reader for Android.\n'
@@ -133,11 +143,11 @@ class _SectionTitle extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(4, 8, 4, 8),
-      child: Text(text,
-          style: Theme.of(context)
-              .textTheme
-              .titleMedium
-              ?.copyWith(color: Theme.of(context).colorScheme.primary)),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.titleMedium
+            ?.copyWith(color: Theme.of(context).colorScheme.primary),
+      ),
     );
   }
 }

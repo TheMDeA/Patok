@@ -15,5 +15,9 @@ rendering fixes.
 - Imported maps now land in the right place and orientation, and the
   camera zooms to a map right after import
 - Zoom-adaptive UTM grid toggle in the Layers sheet
+- Sharp text when zoomed in: map detail re-renders at screen resolution
+  (toggle in Settings)
+- GPS status bar: elevation, horizontal/vertical accuracy, live satellite
+  count, speed, and fix age under the coordinates, with a copy button
 - Sunlight mode applies immediately, no restart needed
 - Toggling layer visibility/opacity no longer re-renders the map

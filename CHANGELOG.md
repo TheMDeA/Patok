@@ -7,9 +7,17 @@ and concise.
 
 ## [1.0.2] - 2026-10-18
 
+### Added
+- Sharp text when zoomed in: map detail re-renders at screen resolution
+  past a zoom threshold (toggle in Settings)
+- GPS status bar under the coordinates: elevation, horizontal/vertical
+  accuracy, live satellite count, speed, and fix age, with a copy button
+
 ### Fixed
 - Waypoints and saved measurements now appear on the map (map
   overlays no longer draw over them)
+- Bottom coordinate bar now shows your GPS position instead of the map
+  center (it could show a stale default location)
 
 ## [1.0.1] - 2026-10-15
 

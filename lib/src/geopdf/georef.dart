@@ -11,7 +11,9 @@ import 'pdf_parser.dart';
 ///
 /// Returns [a, b, c, d, e, f].
 List<double> fitAffine(
-    List<math.Point<double>> src, List<math.Point<double>> dst) {
+  List<math.Point<double>> src,
+  List<math.Point<double>> dst,
+) {
   if (src.length != dst.length || src.length < 3) {
     throw ArgumentError('Need at least 3 point pairs');
   }
@@ -35,14 +37,8 @@ List<double> fitAffine(
     syv += y * v;
     sv += v;
   }
-  final abc = _solve3(
-    [sxx, sxy, sx, sxy, syy, sy, sx, sy, n],
-    [sxu, syu, su],
-  );
-  final def = _solve3(
-    [sxx, sxy, sx, sxy, syy, sy, sx, sy, n],
-    [sxv, syv, sv],
-  );
+  final abc = _solve3([sxx, sxy, sx, sxy, syy, sy, sx, sy, n], [sxu, syu, su]);
+  final def = _solve3([sxx, sxy, sx, sxy, syy, sy, sx, sy, n], [sxv, syv, sv]);
   return [...abc, ...def];
 }
 
@@ -94,8 +90,7 @@ List<math.Point<double>> _pairs(List<double> nums) {
     throw PdfParseException('Odd number of coordinates');
   }
   return [
-    for (var i = 0; i < nums.length; i += 2)
-      math.Point(nums[i], nums[i + 1]),
+    for (var i = 0; i < nums.length; i += 2) math.Point(nums[i], nums[i + 1]),
   ];
 }
 
@@ -156,8 +151,7 @@ class GeorefExtractor {
     }
     for (final v in vps) {
       final measure = _deref(v['Measure']);
-      if (measure is PdfDict &&
-          measure.nameValue('Subtype') == 'GEO') {
+      if (measure is PdfDict && measure.nameValue('Subtype') == 'GEO') {
         final gpts = _pairs(_numbers(_deref(measure['GPTS'])));
         final lpts = _pairs(_numbers(_deref(measure['LPTS'])));
         if (gpts.length < 3 || lpts.length < 3) continue;
@@ -165,8 +159,7 @@ class GeorefExtractor {
         // GPTS pairs are (latitude, longitude) per the geospatial PDF
         // encoding; swap to (lon, lat) for the fit.
         final geo = <math.Point<double>>[
-          for (var i = 0; i < count; i++)
-            math.Point(gpts[i].y, gpts[i].x),
+          for (var i = 0; i < count; i++) math.Point(gpts[i].y, gpts[i].x),
         ];
         var fit = fitAffine(lpts.take(count).toList(), geo);
         // LPTS are often normalized to the viewport /BBox (Avenza-style,
@@ -300,8 +293,8 @@ class GeorefExtractor {
   }
 
   String? _describeTerraGoProjection(PdfDict proj) {
-    final type = proj.stringValue('ProjectionType') ??
-        proj.nameValue('ProjectionType');
+    final type =
+        proj.stringValue('ProjectionType') ?? proj.nameValue('ProjectionType');
     final datum = proj.stringValue('Datum') ?? proj.nameValue('Datum');
     final zone = proj.number('Zone')?.toInt();
     final parts = <String>[];
@@ -310,6 +303,51 @@ class GeorefExtractor {
     if (datum != null) parts.add(datum);
     return parts.isEmpty ? null : parts.join(' ');
   }
+}
+
+/// Inverse of the rotation step in [pixelToUserSpace]: PDF user space
+/// (points, origin bottom-left) -> rotated page space (points).
+/// Used to locate a lon/lat region inside the rendered (rotated) bitmap
+/// for the high-detail re-render.
+math.Point<double> userToRotatedPoint(
+  double ux,
+  double uy, {
+  required double pageW,
+  required double pageH,
+  required int rotation,
+}) {
+  switch (rotation) {
+    case 90:
+      return math.Point(uy, pageW - ux);
+    case 180:
+      return math.Point(pageW - ux, pageH - uy);
+    case 270:
+      return math.Point(pageH - uy, ux);
+    default:
+      return math.Point(ux, uy);
+  }
+}
+
+/// PDF user space (points) -> rotated bitmap pixels at [scale] px/pt.
+/// [fullH] is the virtual full bitmap height in pixels. Inverse of the
+/// pixel mapping in [pixelToUserSpace].
+math.Point<double> userToRotatedPx(
+  double ux,
+  double uy, {
+  required double scale,
+  required double pageW,
+  required double pageH,
+  required int rotation,
+  required double fullH,
+}) {
+  final r = userToRotatedPoint(
+    ux,
+    uy,
+    pageW: pageW,
+    pageH: pageH,
+    rotation: rotation,
+  );
+  return math.Point(r.x * scale, fullH - r.y * scale);
 }
 
 /// Maps a rendered-bitmap pixel to unrotated PDF user space (points).
@@ -344,6 +382,43 @@ math.Point<double> pixelToUserSpace({
   }
 }
 
+/// Inverse of [toLonLat]: WGS84 lon/lat -> source-CRS coordinates.
+/// Used to map a visible map region back into PDF page space for the
+/// high-detail re-render. Falls back to identity when parsing fails.
+math.Point<double> toProjected(double lon, double lat, String? wkt) {
+  if (wkt == null || wkt.isEmpty) {
+    return math.Point(lon, lat);
+  }
+  try {
+    final src = proj4.Projection.parse(wkt);
+    final p = proj4.Projection.WGS84.transform(
+      src,
+      proj4.Point(x: lon, y: lat),
+    );
+    if (!p.x.isFinite || !p.y.isFinite) {
+      return math.Point(lon, lat);
+    }
+    return math.Point(p.x, p.y);
+  } catch (_) {
+    return math.Point(lon, lat);
+  }
+}
+
+/// Inverts the page affine transform: source-CRS (sx, sy) -> PDF user
+/// space (points). Throws [StateError] when the transform is degenerate.
+math.Point<double> inverseAffine(PageGeoref georef, double sx, double sy) {
+  final det = georef.a * georef.e - georef.b * georef.d;
+  if (det.abs() < 1e-12) {
+    throw StateError('Degenerate page transform');
+  }
+  final dx = sx - georef.c;
+  final dy = sy - georef.f;
+  return math.Point(
+    (georef.e * dx - georef.b * dy) / det,
+    (-georef.d * dx + georef.a * dy) / det,
+  );
+}
+
 /// Converts a source-CRS coordinate to WGS84 lon/lat using [wkt].
 /// Falls back to treating the input as lon/lat when parsing fails.
 math.Point<double> toLonLat(double sx, double sy, String? wkt) {
@@ -352,10 +427,7 @@ math.Point<double> toLonLat(double sx, double sy, String? wkt) {
   }
   try {
     final src = proj4.Projection.parse(wkt);
-    final p = src.transform(
-      proj4.Projection.WGS84,
-      proj4.Point(x: sx, y: sy),
-    );
+    final p = src.transform(proj4.Projection.WGS84, proj4.Point(x: sx, y: sy));
     if (!p.x.isFinite || !p.y.isFinite) {
       return math.Point(sx, sy);
     }

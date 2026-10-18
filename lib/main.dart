@@ -13,6 +13,7 @@ Future<void> main() async {
   final renderService = RenderService();
   final importService = ImportService(library, renderService);
   final locationService = LocationService();
+  final gnssService = GnssService()..start();
   final trackRecorder = TrackRecorder(locationService);
   final fieldData = await FieldDataStore.load();
 
@@ -25,6 +26,7 @@ Future<void> main() async {
       renderService: renderService,
       importService: importService,
       locationService: locationService,
+      gnssService: gnssService,
       trackRecorder: trackRecorder,
       settings: settings,
       fieldData: fieldData,

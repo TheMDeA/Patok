@@ -5,6 +5,7 @@ import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
@@ -62,7 +63,8 @@ class MapLibrary {
       final maps = GeoMap.decodeList(await file.readAsString());
       // Drop entries whose PDF is missing.
       maps.removeWhere(
-          (m) => !File('${dir.path}/${m.relativePdfPath}').existsSync());
+        (m) => !File('${dir.path}/${m.relativePdfPath}').existsSync(),
+      );
       return MapLibrary._(dir, maps);
     } catch (_) {
       return MapLibrary._(dir, []);
@@ -174,6 +176,206 @@ class RenderService {
     }
   }
 
+  /// Renders a lon/lat sub-region of a page at high resolution, for the
+  /// zoomed-in detail overlay (like native PDF viewers: vector content
+  /// re-rasterized at screen sharpness). Only the visible region is
+  /// rasterized — never the whole page — so memory stays bounded.
+  ///
+  /// [targetWidthPx] is the desired width of the *region* in pixels;
+  /// the region is capped at 2048px on its long edge for memory safety.
+  Future<PageOverlay> renderRegion({
+    required String pdfPath,
+    required PageGeoref georef,
+    required double minLon,
+    required double minLat,
+    required double maxLon,
+    required double maxLat,
+    required double targetWidthPx,
+  }) async {
+    final doc = await PdfDocument.openFile(pdfPath);
+    try {
+      final page = doc.pages[georef.pageIndex];
+      // 1. lon/lat bbox -> PDF user space (points), via inverse projection
+      //    and inverse affine. Take the bbox of the 4 corners.
+      var ux0 = double.infinity,
+          uy0 = double.infinity,
+          ux1 = -double.infinity,
+          uy1 = -double.infinity;
+      for (final c in [
+        [minLon, minLat],
+        [maxLon, minLat],
+        [maxLon, maxLat],
+        [minLon, maxLat],
+      ]) {
+        final s = georef.srcIsLonLat
+            ? math.Point(c[0], c[1])
+            : toProjected(c[0], c[1], georef.srcWkt);
+        final u = inverseAffine(georef, s.x, s.y);
+        ux0 = math.min(ux0, u.x);
+        uy0 = math.min(uy0, u.y);
+        ux1 = math.max(ux1, u.x);
+        uy1 = math.max(uy1, u.y);
+      }
+      // Clamp to the page with a small margin.
+      const pad = 8.0;
+      ux0 = (ux0 - pad).clamp(0.0, georef.pageWidthPt);
+      uy0 = (uy0 - pad).clamp(0.0, georef.pageHeightPt);
+      ux1 = (ux1 + pad).clamp(0.0, georef.pageWidthPt);
+      uy1 = (uy1 + pad).clamp(0.0, georef.pageHeightPt);
+      if (ux1 - ux0 < 1 || uy1 - uy0 < 1) {
+        throw StateError('Detail region is empty');
+      }
+
+      // 2. Render scale: region width -> targetWidthPx, with the region
+      //    capped at 2048px on its long edge (memory safety).
+      //    Work in rotated bitmap space (PDFium applies /Rotate).
+      final rotated = georef.rotation == 90 || georef.rotation == 270;
+      final rotWpt = rotated ? georef.pageHeightPt : georef.pageWidthPt;
+      final rotHpt = rotated ? georef.pageWidthPt : georef.pageHeightPt;
+      // Region size in rotated points.
+      final rpts = [
+        for (final u in [
+          [ux0, uy0],
+          [ux1, uy0],
+          [ux1, uy1],
+          [ux0, uy1],
+        ])
+          userToRotatedPoint(
+            u[0],
+            u[1],
+            pageW: georef.pageWidthPt,
+            pageH: georef.pageHeightPt,
+            rotation: georef.rotation,
+          ),
+      ];
+      final rxs = rpts.map((p) => p.x);
+      final rys = rpts.map((p) => p.y);
+      final rwPt = rxs.reduce(math.max) - rxs.reduce(math.min);
+      final rhPt = rys.reduce(math.max) - rys.reduce(math.min);
+      var scale = targetWidthPx / rwPt;
+      final regionLongEdge = math.max(rwPt, rhPt) * scale;
+      const maxRegionEdge = 2048.0;
+      if (regionLongEdge > maxRegionEdge) {
+        scale *= maxRegionEdge / regionLongEdge;
+      }
+      // Cap the virtual full size: beyond this we're past useful sharpness
+      // and PDFium's matrix math gets unhappy.
+      const maxVirtualEdge = 32768.0;
+      final virtualLongEdge = math.max(rotWpt, rotHpt) * scale;
+      if (virtualLongEdge > maxVirtualEdge) {
+        scale *= maxVirtualEdge / virtualLongEdge;
+      }
+      final fullW = (rotWpt * scale).round();
+      final fullH = (rotHpt * scale).round();
+
+      // 3. Sub-rectangle in virtual pixels.
+      final p0 = userToRotatedPx(
+        ux0,
+        uy0,
+        scale: scale,
+        pageW: georef.pageWidthPt,
+        pageH: georef.pageHeightPt,
+        rotation: georef.rotation,
+        fullH: fullH.toDouble(),
+      );
+      final p1 = userToRotatedPx(
+        ux1,
+        uy1,
+        scale: scale,
+        pageW: georef.pageWidthPt,
+        pageH: georef.pageHeightPt,
+        rotation: georef.rotation,
+        fullH: fullH.toDouble(),
+      );
+      var x = math.min(p0.x, p1.x).round().clamp(0, fullW);
+      var y = math.min(p0.y, p1.y).round().clamp(0, fullH);
+      var w = (math.max(p0.x, p1.x) - math.min(p0.x, p1.x)).round().clamp(
+        1,
+        fullW - x,
+      );
+      var h = (math.max(p0.y, p1.y) - math.min(p0.y, p1.y)).round().clamp(
+        1,
+        fullH - y,
+      );
+
+      final image = await page.render(
+        x: x,
+        y: y,
+        width: w,
+        height: h,
+        fullWidth: fullW.toDouble(),
+        fullHeight: fullH.toDouble(),
+        backgroundColor: 0x00000000,
+      );
+      if (image == null) {
+        throw StateError('Failed to render region of page ${georef.pageIndex}');
+      }
+      try {
+        final png = await compute(
+          _encodePngIsolate,
+          _PngEncodeArgs(image.width, image.height, image.pixels),
+        );
+        final corners = _cornersForRect(
+          georef: georef,
+          x: x.toDouble(),
+          y: y.toDouble(),
+          w: w.toDouble(),
+          h: h.toDouble(),
+          fullW: fullW.toDouble(),
+          fullH: fullH.toDouble(),
+        );
+        return PageOverlay(
+          pngBytes: png,
+          width: image.width,
+          height: image.height,
+          corners: corners,
+        );
+      } finally {
+        image.dispose();
+      }
+    } finally {
+      await doc.dispose();
+    }
+  }
+
+  /// Bitmap corners (TL, TR, BR, BL) in WGS84 lon/lat for an arbitrary
+  /// sub-rectangle of a rendered page: maps the rect's pixel corners back
+  /// through user space and the page affine into lon/lat.
+  List<math.Point<double>> _cornersForRect({
+    required PageGeoref georef,
+    required double x,
+    required double y,
+    required double w,
+    required double h,
+    required double fullW,
+    required double fullH,
+  }) {
+    final px = [
+      math.Point(x, y),
+      math.Point(x + w, y),
+      math.Point(x + w, y + h),
+      math.Point(x, y + h),
+    ];
+    return [
+      for (final p in px)
+        () {
+          final u = pixelToUserSpace(
+            px: p.x,
+            py: p.y,
+            imgW: fullW,
+            imgH: fullH,
+            pageW: georef.pageWidthPt,
+            pageH: georef.pageHeightPt,
+            rotation: georef.rotation,
+          );
+          final sx = georef.a * u.x + georef.b * u.y + georef.c;
+          final sy = georef.d * u.x + georef.e * u.y + georef.f;
+          if (georef.srcIsLonLat) return math.Point(sx, sy);
+          return toLonLat(sx, sy, georef.srcWkt);
+        }(),
+    ];
+  }
+
   /// Bitmap corners (TL, TR, BR, BL) in WGS84 lon/lat.
   List<math.Point<double>> _corners({
     required PageGeoref georef,
@@ -218,7 +420,8 @@ class ImportService {
   /// messages via [onProgress]. Returns the imported map, or null if
   /// the user cancelled.
   Future<GeoMap?> importWithPicker(
-      void Function(String message) onProgress) async {
+    void Function(String message) onProgress,
+  ) async {
     final files = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf'],
@@ -250,8 +453,9 @@ class ImportService {
     if (georefs.isEmpty) {
       await dest.delete();
       throw StateError(
-          'No georeferencing found in this PDF. Patok reads OGC '
-          'georegistration (/VP /Measure) and TerraGo (/LGIDict) maps.');
+        'No georeferencing found in this PDF. Patok reads OGC '
+        'georegistration (/VP /Measure) and TerraGo (/LGIDict) maps.',
+      );
     }
 
     onProgress('Computing map extents…');
@@ -265,12 +469,14 @@ class ImportService {
         imgW: g.pageWidthPt,
         imgH: g.pageHeightPt,
       );
-      pages.add(GeoMapPage(
-        pageIndex: g.pageIndex,
-        name: georefs.length == 1 ? 'Map' : 'Page ${g.pageIndex + 1}',
-        georef: g,
-        cornerLonLat: corners.map((p) => [p.x, p.y]).toList(),
-      ));
+      pages.add(
+        GeoMapPage(
+          pageIndex: g.pageIndex,
+          name: georefs.length == 1 ? 'Map' : 'Page ${g.pageIndex + 1}',
+          georef: g,
+          cornerLonLat: corners.map((p) => [p.x, p.y]).toList(),
+        ),
+      );
     }
 
     final map = GeoMap(
@@ -334,8 +540,7 @@ class TrackRecorder {
   final ValueNotifier<int> pointCount = ValueNotifier(0);
 
   /// Live (lon, lat) points while recording; empty when idle.
-  final ValueNotifier<List<List<double>>> livePoints =
-      ValueNotifier(const []);
+  final ValueNotifier<List<List<double>>> livePoints = ValueNotifier(const []);
 
   StreamSubscription<Position>? _sub;
   final List<List<double>> _points = [];
@@ -420,11 +625,40 @@ class SettingsService {
 
   /// 'utm' or 'latlon'.
   String get coordFormat => _prefs.getString('coordFormat') ?? 'utm';
-  Future<void> setCoordFormat(String v) =>
-      _prefs.setString('coordFormat', v);
+  Future<void> setCoordFormat(String v) => _prefs.setString('coordFormat', v);
 
   bool get showUtmGrid => _prefs.getBool('showUtmGrid') ?? false;
   Future<void> setShowUtmGrid(bool v) => _prefs.setBool('showUtmGrid', v);
+
+  /// High-detail re-render of the visible map region when zoomed in
+  /// (keeps PDF text sharp like a native viewer). Default on.
+  bool get detailZoom => _prefs.getBool('detailZoom') ?? true;
+  Future<void> setDetailZoom(bool v) => _prefs.setBool('detailZoom', v);
+}
+
+/// GNSS satellite status streamed from the Android side.
+/// [satellites] holds (usedInFix, totalInView) or null when unknown.
+class GnssService {
+  static const _channel = EventChannel('patok/gnss');
+
+  final ValueNotifier<(int, int)?> satellites = ValueNotifier(null);
+  StreamSubscription? _sub;
+
+  void start() {
+    if (_sub != null) return;
+    _sub = _channel.receiveBroadcastStream().listen((event) {
+      try {
+        final m = Map<String, dynamic>.from(event as Map);
+        satellites.value =
+            ((m['used'] as num).toInt(), (m['total'] as num).toInt());
+      } catch (_) {}
+    }, onError: (_) {});
+  }
+
+  void stop() {
+    _sub?.cancel();
+    _sub = null;
+  }
 }
 
 /// Simple JSON store for waypoints and measurements.
