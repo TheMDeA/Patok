@@ -150,19 +150,21 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun handleShareIntent(intent: Intent?) {
-        val uri: Uri? = when (intent?.action) {
+        val action = intent?.action ?: return
+        val uri: Uri? = when (action) {
             Intent.ACTION_SEND -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
                 } else {
                     @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                    intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
                 }
             }
             Intent.ACTION_VIEW -> intent.data
             else -> null
-        } ?: return
-        val path = copySharedPdfToCache(uri) ?: return
+        }
+        val safeUri = uri ?: return
+        val path = copySharedPdfToCache(safeUri) ?: return
         shareSink?.success(path) ?: run { pendingSharedPdf = path }
     }
 
