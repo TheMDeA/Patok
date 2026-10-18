@@ -7,6 +7,14 @@ and concise.
 
 ## [1.0.4] - 2026-10-18
 
+### Added
+- Crosshair placement mode: a center crosshair with one-tap buttons to
+  drop measure points and waypoints exactly at the screen center
+- Storage manager in Settings: per-map disk usage with one-tap clearing
+  of cached previews
+- Compass calibration nudge: a one-time hint to wave the phone in a
+  figure-8 when heading accuracy is poor
+
 ### Fixed
 - Detail rendering is faster: the PDF stays open between renders, pages
   render in parallel, and rapid pans settle before re-rendering

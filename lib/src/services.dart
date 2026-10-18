@@ -572,7 +572,9 @@ class ThumbnailService {
   ThumbnailService(this._render);
   final RenderService _render;
 
-  Future<File> _thumbFile(String mapId) async {
+  /// File backing the cached library thumbnail for [mapId]
+  /// (may not exist yet).
+  Future<File> thumbnailFile(String mapId) async {
     final dir = await _appDir();
     return File('${dir.path}/thumbs/$mapId.png');
   }
@@ -582,7 +584,7 @@ class ThumbnailService {
   /// map has no pages or rendering fails — callers fall back to an icon.
   Future<File?> ensureThumbnail(GeoMap map) async {
     try {
-      final file = await _thumbFile(map.id);
+      final file = await thumbnailFile(map.id);
       if (await file.exists()) return file;
       if (map.pages.isEmpty) return null;
       final dir = await _appDir();
@@ -602,7 +604,7 @@ class ThumbnailService {
 
   Future<void> deleteThumbnail(String mapId) async {
     try {
-      final file = await _thumbFile(mapId);
+      final file = await thumbnailFile(mapId);
       if (await file.exists()) await file.delete();
     } catch (_) {}
   }

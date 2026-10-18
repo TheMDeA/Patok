@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../update_service.dart';
 import 'app_scope.dart';
+import 'storage_screen.dart';
 import 'update_sheet.dart';
 
 /// App settings: sunlight mode, render DPI, coordinate format, updates,
@@ -183,6 +184,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   },
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          _SectionTitle('Storage'),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.storage_outlined,
+                  color: PatokTheme.accent),
+              title: const Text('Storage'),
+              subtitle:
+                  const Text('Per-map disk usage, clear cached previews'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const StorageScreen()),
+              ),
             ),
           ),
           const SizedBox(height: 8),

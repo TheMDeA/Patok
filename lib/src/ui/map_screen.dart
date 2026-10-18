@@ -6,12 +6,15 @@ import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:proj4dart/proj4dart.dart' as proj4;
+import 'package:uuid/uuid.dart';
 
 import 'app_scope.dart';
 import '../models.dart';
 import '../services.dart';
 import '../geopdf/georef.dart';
 import '../theme.dart';
+
+const _uuid = Uuid();
 
 /// Map workspace: full-bleed MapLibre map with imported georeferenced
 /// PDF pages as image overlays, GPS, layers sheet, measure mode and a
@@ -51,6 +54,9 @@ class MapScreenState extends State<MapScreen> {
   final Set<String> _detailSourceIds = {};
   int _detailGen = 0; // cancels stale in-flight detail renders
   Timer? _detailDebounce; // settle-debounce for detail renders
+  bool _precisionMode = false; // crosshair placement mode
+  bool _compassNudgeShown = false; // figure-8 nudge, once per session
+  bool _showCompassNudge = false;
   String _detailKey = ''; // page + quantized viewport + zoom bucket
   // Base overlay bitmap width (px) and page top-edge width (meters),
   // per page key: used to decide when the base is being upscaled.
@@ -112,6 +118,7 @@ class MapScreenState extends State<MapScreen> {
     _posSub = _scope.locationService.positionStream().listen((p) {
       _lastGps = p;
       _updateCoordReadout();
+      _maybeShowCompassNudge(p);
     });
   }
 
@@ -982,6 +989,91 @@ class MapScreenState extends State<MapScreen> {
     await _redrawAnnotations();
   }
 
+  /// Live map center from the visible region (never the stale cached
+  /// camera position).
+  Future<LatLng?> _mapCenter() async {
+    final c = _controller;
+    if (c == null) return null;
+    try {
+      final r = await c.getVisibleRegion();
+      return LatLng(
+        (r.southwest.latitude + r.northeast.latitude) / 2,
+        (r.southwest.longitude + r.northeast.longitude) / 2,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Crosshair: add a measure point exactly at the screen center.
+  Future<void> _addMeasurePointAtCenter() async {
+    final center = await _mapCenter();
+    if (center == null) return;
+    if (!_measureMode) _toggleMeasure();
+    setState(() => _measurePoints.add(center));
+    await _redrawAnnotations();
+  }
+
+  /// Crosshair: drop a planned waypoint exactly at the screen center.
+  Future<void> _addWaypointAtCenter() async {
+    final center = await _mapCenter();
+    if (center == null || !mounted) return;
+    final existing = await _scope.fieldData.waypoints();
+    if (!mounted) return;
+    final name =
+        await _askWaypointName(context, 'Waypoint ${existing.length + 1}');
+    if (name == null || !mounted) return;
+    final wps = List<Waypoint>.of(existing)
+      ..add(Waypoint(
+        id: _uuid.v4(),
+        name: name,
+        longitude: center.longitude,
+        latitude: center.latitude,
+        note: 'Placed from map',
+      ));
+    await _scope.fieldData.saveWaypoints(wps);
+    await _redrawAnnotations();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Waypoint "$name" added')),
+      );
+    }
+  }
+
+  Future<String?> _askWaypointName(BuildContext context, String hint) {
+    final ctrl = TextEditingController(text: hint);
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Waypoint name'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Name'),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: const Text('Save')),
+        ],
+      ),
+    );
+  }
+
+  /// Shows the figure-8 calibration nudge once per session, when the GPS
+  /// heading is unreliable while moving.
+  void _maybeShowCompassNudge(Position p) {
+    if (_compassNudgeShown || _showCompassNudge) return;
+    final poorHeading = !p.hasHeadingAccuracy || p.headingAccuracy > 30;
+    if (poorHeading && p.speed > 0.5) {
+      _compassNudgeShown = true;
+      if (mounted) setState(() => _showCompassNudge = true);
+    }
+  }
+
   double get _measureLength {
     var total = 0.0;
     for (var i = 1; i < _measurePoints.length; i++) {
@@ -1172,6 +1264,44 @@ class MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
+          // Crosshair placement mode.
+          if (_precisionMode)
+            const IgnorePointer(
+              child: Center(child: _Crosshair()),
+            ),
+          // Compass calibration nudge (once per session).
+          if (_showCompassNudge)
+            Positioned(
+              top: 84,
+              left: 12,
+              right: 12,
+              child: Card(
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.explore_outlined,
+                          color: PatokTheme.accent),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Text(
+                          'Heading accuracy is low — wave your phone in a '
+                          'figure-8 to calibrate the compass.',
+                          style: TextStyle(fontSize: 13),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 18),
+                        tooltip: 'Dismiss',
+                        onPressed: () =>
+                            setState(() => _showCompassNudge = false),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           // Empty state (no maps yet) like the mockup.
           if (_scope.library.maps.isEmpty)
             Center(
@@ -1246,6 +1376,32 @@ class MapScreenState extends State<MapScreen> {
                       onPressed: _toggleMeasure,
                       child: const Icon(Icons.straighten),
                     ),
+                    const SizedBox(height: 10),
+                    FloatingActionButton.small(
+                      heroTag: 'precision',
+                      backgroundColor:
+                          _precisionMode ? PatokTheme.accent : null,
+                      tooltip: 'Crosshair placement',
+                      onPressed: () =>
+                          setState(() => _precisionMode = !_precisionMode),
+                      child: const Icon(Icons.center_focus_strong),
+                    ),
+                    if (_precisionMode) ...[
+                      const SizedBox(height: 10),
+                      FloatingActionButton.small(
+                        heroTag: 'pMeasure',
+                        tooltip: 'Add measure point at crosshair',
+                        onPressed: _addMeasurePointAtCenter,
+                        child: const Icon(Icons.add),
+                      ),
+                      const SizedBox(height: 10),
+                      FloatingActionButton.small(
+                        heroTag: 'pWaypoint',
+                        tooltip: 'Add waypoint at crosshair',
+                        onPressed: _addWaypointAtCenter,
+                        child: const Icon(Icons.place),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -1429,6 +1585,43 @@ class _GpsBarState extends State<_GpsBar> {
 
 /// Dynamic scale bar: picks a nice round distance for ~90px at the
 /// current meters-per-pixel and draws a labeled bar.
+/// Center crosshair for precision placement mode.
+class _Crosshair extends StatelessWidget {
+  const _Crosshair();
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      size: const Size(72, 72),
+      painter: _CrosshairPainter(),
+    );
+  }
+}
+
+class _CrosshairPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final paint = Paint()
+      ..color = PatokTheme.accent
+      ..strokeWidth = 2.5
+      ..style = PaintingStyle.stroke;
+    // Ring.
+    canvas.drawCircle(c, 22, paint);
+    // Cross lines through the ring.
+    canvas.drawLine(c + const Offset(-30, 0), c + const Offset(-14, 0), paint);
+    canvas.drawLine(c + const Offset(14, 0), c + const Offset(30, 0), paint);
+    canvas.drawLine(c + const Offset(0, -30), c + const Offset(0, -14), paint);
+    canvas.drawLine(c + const Offset(0, 14), c + const Offset(0, 30), paint);
+    // Center dot.
+    canvas.drawCircle(
+        c, 3, Paint()..color = PatokTheme.accent);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
 class _ScaleBar extends StatelessWidget {
   const _ScaleBar({required this.metersPerPx});
   final ValueNotifier<double> metersPerPx;
