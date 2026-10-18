@@ -20,6 +20,8 @@ and concise.
 ### Fixed
 - Field tab now refreshes when switching to it, so waypoints added from
   the map show up immediately
+- Files shared to Patok (e.g. from WhatsApp) now keep their original
+  filename in the library instead of "shared_<number>"
 - Detail rendering is faster: the PDF stays open between renders, pages
   render in parallel, and rapid pans settle before re-rendering
 

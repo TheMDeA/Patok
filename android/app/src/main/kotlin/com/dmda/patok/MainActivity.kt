@@ -6,6 +6,7 @@ import android.location.GnssStatus
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
@@ -170,7 +171,23 @@ class MainActivity : FlutterActivity() {
 
     private fun copySharedPdfToCache(uri: Uri): String? {
         return try {
-            val dest = File(cacheDir, "shared_${System.currentTimeMillis()}.pdf")
+            // Preserve the sender's filename (e.g. from WhatsApp) so the
+            // library shows the real map name instead of "shared_<millis>".
+            val displayName = contentResolver.query(uri, null, null, null, null)?.use { c ->
+                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            }
+            val base = displayName
+                ?.takeIf { it.isNotBlank() }
+                ?.replace(Regex("[/\\\\]"), "_")
+                ?.let { if (it.endsWith(".pdf", ignoreCase = true)) it else "$it.pdf" }
+                ?: "shared_${System.currentTimeMillis()}.pdf"
+            // Avoid overwriting a previous share with the same name.
+            var dest = File(cacheDir, base)
+            var n = 1
+            while (dest.exists()) {
+                dest = File(cacheDir, "${base.removeSuffix(".pdf")} (${n++}).pdf")
+            }
             contentResolver.openInputStream(uri)?.use { input ->
                 dest.outputStream().use { output -> input.copyTo(output) }
             } ?: return null

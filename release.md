@@ -19,3 +19,5 @@ maintenance tools.
   map show up immediately
 - Smoother map performance: annotations no longer reload from disk on
   every pan/zoom, and track recording redraws only the track line
+- Files shared to Patok (e.g. from WhatsApp) now keep their original
+  filename in the library instead of "shared_<number>"
