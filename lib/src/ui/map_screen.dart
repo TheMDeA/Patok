@@ -67,6 +67,9 @@ class MapScreenState extends State<MapScreen> {
   StreamSubscription<Position>? _posSub;
   Position? _lastGps;
 
+  /// Meters per screen pixel at the current camera; drives the scale bar.
+  final ValueNotifier<double> _metersPerPx = ValueNotifier(1000);
+
   late final TrackRecorder _trackRecorder;
   late final GnssService _gnssService;
 
@@ -92,6 +95,7 @@ class MapScreenState extends State<MapScreen> {
     _trackRecorder.livePoints.removeListener(_onTrackUpdate);
     _posSub?.cancel();
     _gnssService.satellites.removeListener(_onSatellitesChanged);
+    _metersPerPx.dispose();
     super.dispose();
   }
 
@@ -636,6 +640,7 @@ class MapScreenState extends State<MapScreen> {
   static const _srcTrack = 'patok_src_track';
   static const _lyrTrack = 'patok_lyr_track';
   static const _srcMeasure = 'patok_src_measure';
+  static const _lyrMeasureFill = 'patok_lyr_measure_fill';
   static const _lyrMeasureLine = 'patok_lyr_measure_line';
   static const _lyrMeasurePts = 'patok_lyr_measure_pts';
   static const _srcWaypoints = 'patok_src_waypoints';
@@ -693,6 +698,7 @@ class MapScreenState extends State<MapScreen> {
         _lyrGrid,
         _lyrMeasurements,
         _lyrTrack,
+        _lyrMeasureFill,
         _lyrMeasureLine,
         _lyrMeasurePts,
         _lyrWaypoints,
@@ -735,6 +741,14 @@ class MapScreenState extends State<MapScreen> {
         const LineLayerProperties(lineColor: '#FF6B1A', lineWidth: 4.0),
       );
       await c.addGeoJsonSource(_srcMeasure, _emptyFc());
+      await c.addFillLayer(
+        _srcMeasure,
+        _lyrMeasureFill,
+        const FillLayerProperties(
+          fillColor: '#FF6B1A',
+          fillOpacity: 0.25,
+        ),
+      );
       await c.addLineLayer(
         _srcMeasure,
         _lyrMeasureLine,
@@ -782,11 +796,15 @@ class MapScreenState extends State<MapScreen> {
         await c.setGeoJsonSource(_srcGrid, _emptyFc());
       }
 
-      // Saved measurements (green).
+      // Saved measurements (green); area ones draw as closed loops.
       final ms = await _scope.fieldData.measurements();
       await c.setGeoJsonSource(
         _srcMeasurements,
-        _linesFc(ms.map((m) => m.points)),
+        _linesFc(ms.map(
+          (m) => m.areaSqMeters != null && m.points.length >= 3
+              ? [...m.points, m.points.first]
+              : m.points,
+        )),
       );
 
       // In-progress track recording (orange).
@@ -796,14 +814,24 @@ class MapScreenState extends State<MapScreen> {
         liveTrack.length >= 2 ? _linesFc([liveTrack]) : _emptyFc(),
       );
 
-      // Active measure line + vertices.
+      // Active measure line + vertices (+ filled polygon for area).
       if (_measureMode && _measurePoints.isNotEmpty) {
         final pts = _measurePoints
             .map((p) => [p.longitude, p.latitude])
             .toList();
+        final ring = pts.length >= 3 ? [...pts, pts.first] : null;
         await c.setGeoJsonSource(_srcMeasure, {
           'type': 'FeatureCollection',
           'features': [
+            if (ring != null)
+              {
+                'type': 'Feature',
+                'geometry': {
+                  'type': 'Polygon',
+                  'coordinates': [ring],
+                },
+                'properties': {},
+              },
             if (pts.length >= 2)
               {
                 'type': 'Feature',
@@ -950,6 +978,13 @@ class MapScreenState extends State<MapScreen> {
     return total;
   }
 
+  double get _measureArea {
+    if (_measurePoints.length < 3) return 0;
+    return polygonAreaSqMeters(
+      _measurePoints.map((p) => [p.longitude, p.latitude]).toList(),
+    );
+  }
+
   Future<void> _saveMeasurement() async {
     if (_measurePoints.length < 2) return;
     final name = 'Measurement ${_measurePoints.length} pts';
@@ -960,6 +995,7 @@ class MapScreenState extends State<MapScreen> {
         name: name,
         points: _measurePoints.map((p) => [p.longitude, p.latitude]).toList(),
         lengthMeters: _measureLength,
+        areaSqMeters: _measurePoints.length >= 3 ? _measureArea : null,
       ),
     );
     await _scope.fieldData.saveMeasurements(ms);
@@ -990,6 +1026,13 @@ class MapScreenState extends State<MapScreen> {
 
   void _onSatellitesChanged() {
     if (mounted) setState(() {});
+  }
+
+  void _updateMetersPerPx(CameraPosition cam) {
+    final mpp = 156543.03392 *
+        math.cos(cam.target.latitude * math.pi / 180) /
+        math.pow(2, cam.zoom);
+    _metersPerPx.value = mpp;
   }
 
   void _updateCoordReadout() {
@@ -1035,11 +1078,14 @@ class MapScreenState extends State<MapScreen> {
               onMapCreated: (c) => _controller = c,
               onStyleLoadedCallback: _onStyleLoaded,
               onMapClick: _onMapClick,
-              onCameraMove: (_) {
+              onCameraMove: (cam) {
                 // Cancel any in-flight detail render: the viewport moved.
                 _detailGen++;
+                _updateMetersPerPx(cam);
               },
               onCameraIdle: () {
+                final cam = _controller?.cameraPosition;
+                if (cam != null) _updateMetersPerPx(cam);
                 _updateCoordReadout();
                 _redrawAnnotations();
                 _maybeUpdateDetailOverlay();
@@ -1153,32 +1199,43 @@ class MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
-          // Bottom: measure panel or coordinate readout.
+          // Bottom: scale bar + measure panel or coordinate readout.
           Align(
             alignment: Alignment.bottomCenter,
             child: SafeArea(
               child: Padding(
                 padding: const EdgeInsets.all(12),
-                child: _measureMode
-                    ? _MeasurePanel(
-                        lengthMeters: _measureLength,
-                        pointCount: _measurePoints.length,
-                        onUndo: () async {
-                          if (_measurePoints.isNotEmpty) {
-                            setState(() => _measurePoints.removeLast());
-                            await _redrawAnnotations();
-                          }
-                        },
-                        onSave: _saveMeasurement,
-                        onClose: _toggleMeasure,
-                      )
-                    : _GpsBar(
-                        coordText: _coordText,
-                        position: _lastGps,
-                        satellites: _gnssService.satellites.value,
-                        busy: _busy,
-                        status: _status,
-                      ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(left: 4, bottom: 8),
+                      child: _ScaleBar(metersPerPx: _metersPerPx),
+                    ),
+                    _measureMode
+                        ? _MeasurePanel(
+                            lengthMeters: _measureLength,
+                            areaSqMeters: _measureArea,
+                            pointCount: _measurePoints.length,
+                            onUndo: () async {
+                              if (_measurePoints.isNotEmpty) {
+                                setState(() => _measurePoints.removeLast());
+                                await _redrawAnnotations();
+                              }
+                            },
+                            onSave: _saveMeasurement,
+                            onClose: _toggleMeasure,
+                          )
+                        : _GpsBar(
+                            coordText: _coordText,
+                            position: _lastGps,
+                            satellites: _gnssService.satellites.value,
+                            busy: _busy,
+                            status: _status,
+                          ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -1316,15 +1373,86 @@ class _GpsBarState extends State<_GpsBar> {
   }
 }
 
+/// Dynamic scale bar: picks a nice round distance for ~90px at the
+/// current meters-per-pixel and draws a labeled bar.
+class _ScaleBar extends StatelessWidget {
+  const _ScaleBar({required this.metersPerPx});
+  final ValueNotifier<double> metersPerPx;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<double>(
+      valueListenable: metersPerPx,
+      builder: (context, mpp, _) {
+        if (!mpp.isFinite || mpp <= 0) return const SizedBox.shrink();
+        // Largest nice number (1/2/5 × 10ⁿ) fitting in ~90px.
+        final raw = mpp * 90;
+        final exp = (math.log(raw) / math.ln10).floor();
+        final base = math.pow(10, exp).toDouble();
+        var nice = base;
+        for (final m in [5, 2, 1]) {
+          if (m * base <= raw) {
+            nice = m * base;
+            break;
+          }
+        }
+        final px = (nice / mpp).clamp(28.0, 220.0);
+        final label = nice >= 1000
+            ? '${_trimNum(nice / 1000)} km'
+            : '${_trimNum(nice)} m';
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: PatokTheme.surface.withValues(alpha: 0.85),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      fontFamily: 'monospace',
+                      fontFamilyFallback: const ['monospace'],
+                    ),
+              ),
+              const SizedBox(height: 2),
+              Container(
+                width: px,
+                height: 4,
+                decoration: BoxDecoration(
+                  border: Border(
+                    left: BorderSide(
+                        color: PatokTheme.onBg, width: 2),
+                    right: BorderSide(
+                        color: PatokTheme.onBg, width: 2),
+                    bottom: BorderSide(
+                        color: PatokTheme.onBg, width: 2),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  String _trimNum(double v) =>
+      v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
+}
+
 class _MeasurePanel extends StatelessWidget {
   const _MeasurePanel({
     required this.lengthMeters,
+    required this.areaSqMeters,
     required this.pointCount,
     required this.onUndo,
     required this.onSave,
     required this.onClose,
   });
   final double lengthMeters;
+  final double areaSqMeters;
   final int pointCount;
   final VoidCallback onUndo;
   final VoidCallback onSave;
@@ -1333,6 +1461,11 @@ class _MeasurePanel extends StatelessWidget {
   String get _formatted {
     if (lengthMeters < 1000) return '${lengthMeters.toStringAsFixed(1)} m';
     return '${(lengthMeters / 1000).toStringAsFixed(2)} km';
+  }
+
+  String get _formattedArea {
+    if (areaSqMeters < 10000) return '${areaSqMeters.toStringAsFixed(0)} m²';
+    return '${(areaSqMeters / 10000).toStringAsFixed(2)} ha';
   }
 
   @override
@@ -1358,6 +1491,13 @@ class _MeasurePanel extends StatelessWidget {
               IconButton(onPressed: onClose, icon: const Icon(Icons.close)),
             ],
           ),
+          if (areaSqMeters > 0)
+            Text(
+              'Area: $_formattedArea',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: PatokTheme.accent,
+                  ),
+            ),
           Text(
             '$pointCount point(s) — tap map to add',
             style: Theme.of(context).textTheme.bodySmall,
