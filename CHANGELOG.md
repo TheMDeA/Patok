@@ -6,6 +6,8 @@ and concise.
 ## [1.1.0] - 2026-11-17
 
 ### Fixed
+- Fixed a build error in the new track-recording service that prevented
+  the app from compiling
 - Fixed a random "page(s) failed to render" error (Source already
   exists): overlapping map refreshes no longer race on the same source
 - DXF import now warns when the drawing's coordinates don't look like
