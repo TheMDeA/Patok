@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../dxf/dxf_import.dart';
 import '../models.dart';
@@ -54,9 +56,22 @@ class _HomeScreenState extends State<HomeScreen> {
     // "Open with Patok": a PDF shared from another app. Cold-start shares
     // are buffered natively and delivered on first listen; later shares
     // arrive live on the same stream.
-    _shareSub = ShareIntentService().sharedPdfStream.listen((path) {
-      if (mounted) _importShared(path);
-    });
+    _shareSub = ShareIntentService().sharedPdfStream.listen(
+      (path) {
+        if (mounted) _importShared(path);
+      },
+      onError: (Object e) {
+        // The native share copy failed (e.g. the sending app revoked
+        // the file): say so instead of doing nothing.
+        if (!mounted) return;
+        final msg = e is PlatformException
+            ? (e.message ?? 'Could not open the shared file')
+            : e.toString();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg)),
+        );
+      },
+    );
   }
 
   StreamSubscription<String>? _shareSub;
@@ -77,7 +92,16 @@ class _HomeScreenState extends State<HomeScreen> {
       MaterialPageRoute(
           builder: (_) => ImportScreen(sharedPath: path)),
     );
-    if (map != null && mounted) _openMap(map);
+    if (map != null && mounted) {
+      // The shared file is a disposable copy in the app cache; the
+      // import already copied it into the library, so remove it.
+      try {
+        await File(path).delete();
+      } catch (_) {
+        // Best effort: a leftover cache copy is harmless.
+      }
+      _openMap(map);
+    }
   }
 
   @override
@@ -102,12 +126,49 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Map-tab point picker for DXF grid calibration: switches to the Map
   /// tab, waits for the native map, and completes with the picked
-  /// position (or null if cancelled / unavailable).
+  /// position (or null if cancelled / unavailable). Shows a status
+  /// message if the map takes a while to become ready, and a clear
+  /// error instead of silently giving up when it never does.
   Future<({double lon, double lat})?> _pickPointOnMap(String prompt) async {
     _onTab(0);
-    for (var i = 0; i < 50; i++) {
-      if (_mapState?.isMapReady ?? false) break;
-      await Future.delayed(const Duration(milliseconds: 200));
+    var ready = false;
+    var statusShown = false;
+    // Only mention the wait if it drags on; the common case is fast
+    // and shows nothing.
+    final statusTimer = Timer(const Duration(seconds: 1), () {
+      if (!ready && mounted) {
+        statusShown = true;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Waiting for the map…'),
+            duration: Duration(seconds: 10),
+          ),
+        );
+      }
+    });
+    try {
+      for (var i = 0; i < 50; i++) {
+        if (_mapState?.isMapReady ?? false) {
+          ready = true;
+          break;
+        }
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    } finally {
+      statusTimer.cancel();
+    }
+    if (statusShown && mounted) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    }
+    if (!ready) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Map isn\'t ready yet — please try again'),
+          ),
+        );
+      }
+      return null;
     }
     final pt = await _mapState?.pickPoint(prompt: prompt);
     if (pt == null) return null;
@@ -135,6 +196,11 @@ class _HomeScreenState extends State<HomeScreen> {
     // caller (DXF grid calibration) never hangs.
     if (i != 0 && (_mapState?.isPicking ?? false)) {
       _mapState?.cancelPick();
+    }
+    // Leaving the Map tab hides it: the map's GPS-bar and recording
+    // timers only run while the tab is visible (o12).
+    if (i != 0) {
+      _mapState?.didBecomeHidden();
     }
     setState(() => _index = i);
     WidgetsBinding.instance.addPostFrameCallback((_) {

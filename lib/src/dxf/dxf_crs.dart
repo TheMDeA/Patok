@@ -13,8 +13,11 @@ import 'dart:math' as math;
 
 import 'package:proj4dart/proj4dart.dart' as proj4;
 
-/// Suggests the UTM zone number for a longitude.
-int utmZoneFor(double lon) => ((lon + 180) / 6).floor() + 1;
+/// Suggests the UTM zone number for a longitude (clamped to 1..60).
+int utmZoneFor(double lon) {
+  final zone = ((lon + 180) / 6).floor() + 1;
+  return zone.clamp(1, 60);
+}
 
 /// A coordinate reference mapping DXF (easting, northing) to lon/lat.
 sealed class DxfCrs {
@@ -54,16 +57,28 @@ sealed class DxfCrs {
 
 /// Plain UTM reference.
 class DxfUtm extends DxfCrs {
-  DxfUtm({required this.zone, this.southernHemisphere = true});
+  DxfUtm({required this.zone, this.southernHemisphere = true}) {
+    if (zone < 1 || zone > 60) {
+      throw ArgumentError.value(zone, 'zone', 'UTM zone must be 1..60');
+    }
+  }
 
   final int zone;
   final bool southernHemisphere;
 
-  proj4.Projection? _proj;
-  proj4.Projection get _p => _proj ??= proj4.Projection.parse(
+  // Projections are parsed once per zone/hemisphere and shared: grid
+  // previews re-solve on every keystroke and must not re-parse each time.
+  static final _projCache = <String, proj4.Projection>{};
+  proj4.Projection get _p {
+    final key = '$zone|${southernHemisphere ? 'S' : 'N'}';
+    return _projCache.putIfAbsent(
+      key,
+      () => proj4.Projection.parse(
         '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
         '${southernHemisphere ? ' +south' : ''}',
-      );
+      ),
+    );
+  }
 
   @override
   (double lon, double lat) toLonLat(double easting, double northing) {
@@ -159,7 +174,24 @@ class DxfLocalGrid extends DxfCrs {
     final uvx = u2.$1 - u1.$1;
     final uvy = u2.$2 - u1.$2;
     final uLen = math.sqrt(uvx * uvx + uvy * uvy);
+    // The local distance alone is not enough: two reference points at
+    // (nearly) the same real-world spot give a ~0 scale and collapse the
+    // whole drawing to a point.
+    if (!uLen.isFinite || uLen < 1.0) {
+      throw StateError(
+        'Reference points are (nearly) the same real-world location — '
+        'pick two distinct points.',
+      );
+    }
     final scale = uLen / lLen;
+    // Mine local grids are metres or feet (~1 or ~0.3); a scale outside
+    // this band means a typo in a reference point, not a real grid.
+    if (!scale.isFinite || scale < 0.01 || scale > 100) {
+      throw StateError(
+        'Solved scale ${scale.toStringAsFixed(4)} is implausible — '
+        'check the reference points.',
+      );
+    }
     final theta = math.atan2(uvy, uvx) - math.atan2(lvy, lvx);
     final c = math.cos(theta);
     final s = math.sin(theta);
@@ -217,20 +249,31 @@ class DxfLocalGridStore {
 
   Future<List<DxfLocalGrid>> all() async {
     if (!await _file.exists()) return [];
+    List decoded;
     try {
-      final list = jsonDecode(await _file.readAsString()) as List;
-      return list
-          .map((j) =>
-              DxfCrs.fromJson(j as Map<String, dynamic>) as DxfLocalGrid)
-          .toList();
+      decoded = jsonDecode(await _file.readAsString()) as List;
     } catch (_) {
       return [];
     }
+    // One corrupt entry must not wipe the rest of the saved grids.
+    final grids = <DxfLocalGrid>[];
+    for (final j in decoded) {
+      try {
+        grids.add(DxfCrs.fromJson(j as Map<String, dynamic>) as DxfLocalGrid);
+      } catch (_) {
+        // Skip the bad entry; the rest still load.
+      }
+    }
+    return grids;
   }
 
   Future<void> saveAll(List<DxfLocalGrid> grids) async {
-    await _file.writeAsString(
+    // Atomic write: a crash mid-write must not leave a truncated file
+    // behind (which the next load would read as "no grids at all").
+    final tmp = File('${_file.path}.tmp');
+    await tmp.writeAsString(
       jsonEncode(grids.map((g) => g.toJson()).toList()),
     );
+    await tmp.rename(_file.path);
   }
 }

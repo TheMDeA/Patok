@@ -16,6 +16,11 @@ Future<void> main() async {
   final thumbnailService = ThumbnailService(renderService);
   final locationService = LocationService();
   final gnssService = GnssService()..start();
+  // The GNSS stream can't start before location permission exists, so
+  // the first start() (above) may die silently; retry it the moment
+  // permission is granted instead of leaving the satellite count blank
+  // until the next app restart.
+  locationService.onPermissionGranted = gnssService.ensureStarted;
   final trackRecorder = TrackRecorder(locationService);
   final fieldData = await FieldDataStore.load();
   final localGrids = await library.dxfLocalGrids();

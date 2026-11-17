@@ -55,9 +55,19 @@ class PdfArray extends PdfObject {
   final List<PdfObject> items;
   const PdfArray(this.items);
 
-  /// All items as numbers (throws if any item is not a number).
-  List<double> get numbers =>
-      items.map((e) => (e as PdfNumber).value).toList();
+  /// All items as numbers. Accepts plain numbers and strings holding a
+  /// number: TerraGo encodes some arrays (notably /CTM) as PDF strings,
+  /// e.g. `[(35.28267) (0) ...]`, and the patent allows numbers "or a
+  /// string representation". Throws [PdfParseException] (not a raw
+  /// [TypeError]) when an item is not a number.
+  List<double> get numbers => items.map((e) {
+    if (e is PdfNumber) return e.value;
+    if (e is PdfString) {
+      final v = double.tryParse(e.value.trim());
+      if (v != null && v.isFinite) return v;
+    }
+    throw PdfParseException('Expected number in array, got $e');
+  }).toList();
 
   @override
   String toString() => '[${items.length} items]';

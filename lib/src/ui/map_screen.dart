@@ -48,8 +48,11 @@ class MapScreenState extends State<MapScreen> {
   final Set<String> _layerIds = {};
 
   // Dirty-checking for tab switches: re-render only when the library
-  // or the render DPI changed while the Map tab was hidden.
-  int _lastFingerprint = 0;
+  // or the render DPI changed while the Map tab was hidden. Tracked
+  // separately for maps and DXF so a DXF-only change doesn't pay for a
+  // full PDF re-render (and vice versa).
+  int _lastMapFingerprint = 0;
+  int _lastDxfFingerprint = 0;
   double _lastDpi = -1;
 
   // High-detail overlay: hi-res re-render of the visible region when
@@ -76,13 +79,23 @@ class MapScreenState extends State<MapScreen> {
   bool _measureMode = false;
   final List<LatLng> _measurePoints = [];
 
-  // Coordinate readout.
-  String _coordText = '—';
+  // Coordinate readout. Notifiers, not plain fields: the GPS bar
+  // listens to them directly, so a GPS fix no longer rebuilds the
+  // whole screen (see _GpsBar).
+  final ValueNotifier<String> _coordText = ValueNotifier('—');
   StreamSubscription<Position>? _posSub;
-  Position? _lastGps;
+  final ValueNotifier<Position?> _lastGps = ValueNotifier(null);
+
+  /// Whether the Map tab is currently visible. The screen is never
+  /// disposed (IndexedStack), so the GPS bar / REC pill timers gate on
+  /// this instead of ticking for the app's whole lifetime.
+  final ValueNotifier<bool> _tabVisible = ValueNotifier(true);
 
   /// Meters per screen pixel at the current camera; drives the scale bar.
-  final ValueNotifier<double> _metersPerPx = ValueNotifier(1000);
+  /// 0 until the first live measurement: the old 1000 default made the
+  /// waypoint hit-test use a bogus ~28 km threshold before the first
+  /// scale-bar refresh.
+  final ValueNotifier<double> _metersPerPx = ValueNotifier(0);
 
   late final TrackRecorder _trackRecorder;
   late final GnssService _gnssService;
@@ -98,7 +111,6 @@ class MapScreenState extends State<MapScreen> {
     _gnssService = AppScope.of(context).gnssService;
     _loadFieldData(); // warm the in-memory cache
     _trackRecorder.livePoints.addListener(_onTrackUpdate);
-    _gnssService.satellites.addListener(_onSatellitesChanged);
   }
 
   void _onTrackUpdate() {
@@ -109,8 +121,11 @@ class MapScreenState extends State<MapScreen> {
   void dispose() {
     _trackRecorder.livePoints.removeListener(_onTrackUpdate);
     _posSub?.cancel();
-    _gnssService.satellites.removeListener(_onSatellitesChanged);
     _metersPerPx.dispose();
+    _coordText.dispose();
+    _lastGps.dispose();
+    _tabVisible.dispose();
+    _trackRedrawTimer?.cancel();
     _detailDebounce?.cancel();
     // Never leave a pick caller hanging.
     _pickCompleter?.complete(null);
@@ -124,10 +139,11 @@ class MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _startGps() async {
+    if (_posSub != null) return; // Already subscribed (e.g. tab re-shown).
     final ok = await _scope.locationService.ensurePermission();
     if (!ok) return;
     _posSub = _scope.locationService.positionStream().listen((p) {
-      _lastGps = p;
+      _lastGps.value = p;
       _updateCoordReadout();
       _maybeShowCompassNudge(p);
     });
@@ -138,7 +154,9 @@ class MapScreenState extends State<MapScreen> {
   String _sourceId(GeoMap m, GeoMapPage p) => 'fa_src_${m.id}_${p.pageIndex}';
   String _layerId(GeoMap m, GeoMapPage p) => 'fa_lyr_${m.id}_${p.pageIndex}';
 
-  Future<void> _onStyleLoaded() async {
+  Future<void> _onStyleLoaded() => _styleGuard.run(_onStyleLoadedInner);
+
+  Future<void> _onStyleLoadedInner() async {
     // A style reload wipes all custom layers/sources: rebuild the
     // annotation stack first so the PDF overlays below can reference it.
     _annLayersReady = false;
@@ -158,6 +176,16 @@ class MapScreenState extends State<MapScreen> {
   /// joins the in-flight one and triggers one re-run afterwards.
   final RefreshGuard _overlaysGuard = RefreshGuard();
   final RefreshGuard _dxfGuard = RefreshGuard();
+  // Serializes style-load handling and annotation-layer creation: the
+  // ready-check in _ensureAnnotationLayers is check-then-act, and a
+  // double style load used to run it twice concurrently, creating the
+  // same layers twice and leaving waypoints/grid invisible.
+  final RefreshGuard _styleGuard = RefreshGuard();
+  final RefreshGuard _annGuard = RefreshGuard();
+  // Serializes + throttles the per-fix track redraw (see _redrawTrack).
+  final RefreshGuard _trackGuard = RefreshGuard();
+  DateTime _lastTrackRedraw = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _trackRedrawTimer;
 
   Future<void> _refreshOverlays() => _overlaysGuard.run(_refreshOverlaysInner);
 
@@ -185,10 +213,12 @@ class MapScreenState extends State<MapScreen> {
     _layerIds.clear();
     _sourceIds.clear();
 
-    setState(() {
-      _busy = true;
-      _status = 'Rendering maps…';
-    });
+    if (mounted) {
+      setState(() {
+        _busy = true;
+        _status = 'Rendering maps…';
+      });
+    }
     var failures = 0;
     String? firstError;
     for (final map in _scope.library.maps) {
@@ -211,7 +241,7 @@ class MapScreenState extends State<MapScreen> {
             : null;
       });
     }
-    _lastFingerprint = _libraryFingerprint();
+    _lastMapFingerprint = _mapFingerprint();
     _lastDpi = _scope.settings.renderDpi;
   }
 
@@ -220,6 +250,14 @@ class MapScreenState extends State<MapScreen> {
     GeoMap map,
     GeoMapPage page,
   ) async {
+    // Fail fast on bad corners before spending seconds rendering the
+    // page (the post-render check below stays as a safety net).
+    _validateQuad(
+      page.cornerLonLat
+          .map((p) => math.Point<double>(p[0], p[1]))
+          .toList(),
+      page,
+    );
     final pdfPath = _scope.library.pdfPath(map);
     final overlay = await _scope.renderService.renderPage(
       pdfPath: pdfPath,
@@ -272,6 +310,9 @@ class MapScreenState extends State<MapScreen> {
   ///
   /// Removes the high-detail overlay for one page (if present).
   Future<void> _removeDetailForPage(GeoMap map, GeoMapPage page) async {
+    // Cancel any in-flight detail render for this page, even when
+    // nothing is on the map yet (it may be about to add the layer).
+    _detailGen++;
     final c = _controller;
     final sid = '$_detailSrcPrefix${map.id}_${page.pageIndex}';
     final lid = '$_detailLyrPrefix${map.id}_${page.pageIndex}';
@@ -291,7 +332,13 @@ class MapScreenState extends State<MapScreen> {
   }
 
   /// Removes the high-detail overlay layers/sources (if any).
-  Future<void> _clearDetailOverlay() async {
+  /// Bumps [_detailGen] so any in-flight detail render is cancelled:
+  /// a base refresh clearing the overlay must not let a stale render
+  /// re-add layers for the pre-refresh viewport afterwards. The
+  /// swap-in step of [_maybeUpdateDetailOverlay] passes
+  /// `bumpGen: false` (it re-checks the generation itself instead).
+  Future<void> _clearDetailOverlay({bool bumpGen = true}) async {
+    if (bumpGen) _detailGen++;
     final c = _controller;
     _detailKey = '';
     if (c == null) {
@@ -316,7 +363,9 @@ class MapScreenState extends State<MapScreen> {
   /// Re-renders the visible region at high detail when zoomed in past the
   /// point where the base overlay starts upscaling (text would go blurry).
   /// Runs on camera idle; stale renders are cancelled via [_detailGen].
-  Future<void> _maybeUpdateDetailOverlay() async {
+  /// [region] is the visible region already fetched by the caller
+  /// (camera idle fetches it once and shares it); fetched here when null.
+  Future<void> _maybeUpdateDetailOverlay({LatLngBounds? region}) async {
     final c = _controller;
     if (c == null) return;
     if (!_scope.settings.detailZoom) {
@@ -325,7 +374,7 @@ class MapScreenState extends State<MapScreen> {
     }
     final gen = ++_detailGen;
     try {
-      final region = await c.getVisibleRegion();
+      region ??= await c.getVisibleRegion();
       if (gen != _detailGen) return;
       // Screen meters-per-pixel from the live region — never from the
       // plugin's cached camera position (can go stale; see
@@ -420,36 +469,45 @@ class MapScreenState extends State<MapScreen> {
       final newKey = keyBuf.toString();
       if (newKey == _detailKey) return;
 
-      // Render regions in parallel (each is viewport-sized); the shared
-      // document cache keeps this from re-parsing the PDF per region.
-      final results = await Future.wait(
-        targets.map((t) async {
-          try {
-            final overlay = await _scope.renderService.renderRegion(
-              pdfPath: _scope.library.pdfPath(t.map),
-              georef: t.page.georef,
-              minLon: t.minLon,
-              minLat: t.minLat,
-              maxLon: t.maxLon,
-              maxLat: t.maxLat,
-              targetWidthPx: t.targetWidthPx,
-            );
-            return MapEntry(t, overlay);
-          } catch (e) {
-            debugPrint('Patok: detail render failed: $e');
-            return null;
-          }
-        }),
-      );
-      final rendered = <_DetailTarget, PageOverlay>{
-        for (final e in results)
-          if (e != null) e.key: e.value,
-      };
+      // Render regions two at a time (each holds a viewport-sized
+      // bitmap up to 2048 px; all in parallel used to hold N of them
+      // at once). The shared document cache keeps this from re-parsing
+      // the PDF per region.
+      final rendered = <_DetailTarget, PageOverlay>{};
+      for (var i = 0; i < targets.length; i += 2) {
+        final batch = targets.sublist(i, math.min(i + 2, targets.length));
+        final results = await Future.wait(
+          batch.map((t) async {
+            try {
+              final overlay = await _scope.renderService.renderRegion(
+                pdfPath: _scope.library.pdfPath(t.map),
+                georef: t.page.georef,
+                minLon: t.minLon,
+                minLat: t.minLat,
+                maxLon: t.maxLon,
+                maxLat: t.maxLat,
+                targetWidthPx: t.targetWidthPx,
+              );
+              return MapEntry(t, overlay);
+            } catch (e) {
+              debugPrint('Patok: detail render failed: $e');
+              return null;
+            }
+          }),
+        );
+        for (final e in results) {
+          if (e != null) rendered[e.key] = e.value;
+        }
+        if (gen != _detailGen) return; // cancelled mid-batch
+      }
       if (gen != _detailGen) return; // cancelled while rendering
       if (!mounted) return;
 
       // Swap in the new detail layers (below annotations, above base).
-      await _clearDetailOverlay();
+      // No gen bump here: this run owns the swap. Re-check instead —
+      // a base refresh may have cleared the overlay while we waited.
+      await _clearDetailOverlay(bumpGen: false);
+      if (gen != _detailGen) return; // cancelled while clearing
       for (final entry in rendered.entries) {
         final t = entry.key;
         final overlay = entry.value;
@@ -549,7 +607,12 @@ class MapScreenState extends State<MapScreen> {
 
   /// Applies a map's visibility/opacity without re-rendering its PDF
   /// pages: the image source is kept, only the raster layer is re-added.
-  Future<void> _applyLayerState(GeoMap map) async {
+  /// Serialized through the overlays guard so a layers-sheet toggle
+  /// can't race a refresh on the same source/layer ids.
+  Future<void> _applyLayerState(GeoMap map) =>
+      _overlaysGuard.run(() => _applyLayerStateInner(map));
+
+  Future<void> _applyLayerStateInner(GeoMap map) async {
     final c = _controller;
     if (c == null) return;
     for (final page in map.pages) {
@@ -559,8 +622,10 @@ class MapScreenState extends State<MapScreen> {
       if (map.visible && !hasLayer) {
         if (!_sourceIds.contains(sid)) {
           // Source is gone (e.g. style reloaded mid-sheet); fall back
-          // to a full refresh.
-          await _refreshOverlays();
+          // to a full refresh. Already inside the guard's critical
+          // section: call the inner refresh directly — the guarded
+          // wrapper would join this run's own future and deadlock.
+          await _refreshOverlaysInner();
           return;
         }
         await _addPdfRasterLayer(c, sid, lid, map.opacity);
@@ -614,8 +679,28 @@ class MapScreenState extends State<MapScreen> {
       }
     }
     if (changed) await _scope.library.save();
-    await _refreshOverlays();
+    // Skip the (seconds-long) re-render when nothing changed and the
+    // overlay sources are already on the map.
+    final fingerprintChanged =
+        _mapFingerprint() != _lastMapFingerprint ||
+        _scope.settings.renderDpi != _lastDpi;
+    if (changed || fingerprintChanged || !_sourcesPresent()) {
+      await _refreshOverlays();
+    }
     await _zoomToMap(map);
+  }
+
+  /// Whether every visible map page already has its image source on
+  /// the map (used by [openMap] to skip a redundant re-render).
+  bool _sourcesPresent() {
+    if (_controller == null) return false;
+    for (final m in _scope.library.maps) {
+      if (!m.visible) continue;
+      for (final p in m.pages) {
+        if (!_sourceIds.contains(_sourceId(m, p))) return false;
+      }
+    }
+    return true;
   }
 
   /// Opens a DXF import: makes it visible, renders its overlay, zooms to it.
@@ -626,9 +711,27 @@ class MapScreenState extends State<MapScreen> {
     }
     // The map may still be initializing on first visit: wait briefly for
     // the controller + annotation stack instead of silently no-opping.
+    var ready = false;
     for (var i = 0; i < 50; i++) {
-      if (_controller != null && _annLayersReady) break;
+      if (_controller != null && _annLayersReady) {
+        ready = true;
+        break;
+      }
       await Future.delayed(const Duration(milliseconds: 200));
+    }
+    if (!ready) {
+      // Don't silently do nothing after 10 s: the user tapped "open"
+      // and deserves to know the map never became ready.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Map is not ready yet — try opening the drawing again.',
+            ),
+          ),
+        );
+      }
+      return;
     }
     await _refreshDxfOverlays();
     await _zoomToDxf(imp);
@@ -637,18 +740,42 @@ class MapScreenState extends State<MapScreen> {
   /// Called by the home shell when the Map tab becomes visible: refreshes
   /// overlays only if the library (or render DPI) changed while hidden,
   /// reloads field data (it may have changed in another tab), and always
-  /// redraws annotations.
+  /// redraws annotations. Maps and DXF are checked separately so a
+  /// DXF-only change doesn't pay for a full PDF re-render.
   Future<void> didBecomeVisible() async {
-    if (_libraryFingerprint() != _lastFingerprint ||
-        _scope.settings.renderDpi != _lastDpi) {
-      await _refreshOverlays();
-      await _refreshDxfOverlays();
-    }
+    _tabVisible.value = true;
+    // Resume GPS fixes (paused by didBecomeHidden); must run before
+    // _startGps subscribes, or the stream stays paused.
+    _scope.locationService.startPositionUpdates();
+    await _startGps();
+    final mapChanged = _mapFingerprint() != _lastMapFingerprint ||
+        _scope.settings.renderDpi != _lastDpi;
+    final dxfChanged = _dxfFingerprint() != _lastDxfFingerprint;
+    if (mapChanged) await _refreshOverlays();
+    if (dxfChanged) await _refreshDxfOverlays();
     await _loadFieldData();
     _updateCoordReadout();
     await _redrawAnnotations();
     // Settings (e.g. the detail toggle) may have changed while away.
     _maybeUpdateDetailOverlay();
+  }
+
+  /// Called by the home shell when the user leaves the Map tab.
+  /// (HomeScreen must call this on tab switch away from the map; it
+  /// stops the GPS bar / REC pill timers, which otherwise tick for the
+  /// app's whole lifetime since this screen is never disposed.)
+  void didBecomeHidden() {
+    _tabVisible.value = false;
+    // Pause GPS fixes while another tab is in front — this screen is
+    // never disposed (IndexedStack), so this is the only off-switch.
+    // A recording keeps its own subscription, so it is unaffected;
+    // when it stops on another tab, the stream dies with its last
+    // listener because this subscription is already gone.
+    _posSub?.cancel();
+    _posSub = null;
+    if (!_trackRecorder.isRecording.value) {
+      _scope.locationService.stopPositionUpdates();
+    }
   }
 
   /// Enters measure mode (idempotent; safe to call when already active).
@@ -662,14 +789,37 @@ class MapScreenState extends State<MapScreen> {
   /// Centers the camera on the current GPS position.
   Future<void> goToGps() => _goToGps();
 
-  int _libraryFingerprint() {
+  /// Fingerprint of the PDF-map state that affects the base overlays:
+  /// which maps exist, their visibility, opacity, and page count.
+  int _mapFingerprint() {
     final maps = _scope.library.maps;
     var h = maps.length * 31 + 7;
     for (final m in maps) {
       h = h * 31 + m.id.hashCode + (m.visible ? 1 : 0);
+      h = h * 31 + (m.opacity * 100).round();
+      h = h * 31 + m.pages.length;
     }
+    return h;
+  }
+
+  /// Fingerprint of the DXF state that affects the DXF overlays:
+  /// which imports exist, their visibility, opacity, and CAD-layer
+  /// toggles.
+  int _dxfFingerprint() {
+    var h = 7;
     for (final d in _scope.library.dxfImports) {
       h = h * 31 + d.id.hashCode + (d.visible ? 1 : 0);
+      h = h * 31 + (d.opacity * 100).round();
+      h = h * 31 + _cadLayersFingerprint(d);
+    }
+    return h;
+  }
+
+  /// Fingerprint of one import's CAD-layer toggles.
+  static int _cadLayersFingerprint(DxfImport imp) {
+    var h = 0;
+    for (final e in imp.cadLayers.entries) {
+      h = h * 31 + e.key.hashCode + (e.value ? 1 : 0);
     }
     return h;
   }
@@ -774,7 +924,13 @@ class MapScreenState extends State<MapScreen> {
 
   /// Creates the annotation sources/layers. Idempotent per style load;
   /// must run before any raster overlay is added with belowLayerId.
-  Future<void> _ensureAnnotationLayers() async {
+  /// Serialized through its own guard: the ready-check below is
+  /// check-then-act, and two concurrent runs created the same layers
+  /// twice ("already exists").
+  Future<void> _ensureAnnotationLayers() =>
+      _annGuard.run(_ensureAnnotationLayersInner);
+
+  Future<void> _ensureAnnotationLayersInner() async {
     final c = _controller;
     if (c == null || _annLayersReady) return;
     try {
@@ -882,13 +1038,17 @@ class MapScreenState extends State<MapScreen> {
   }
 
   /// Viewport-dependent annotations only (UTM grid). Cheap; safe on every
-  /// camera idle.
-  Future<void> _redrawGrid() async {
+  /// camera idle. [region] is the visible region already fetched by the
+  /// caller; fetched here when null.
+  Future<void> _redrawGrid({LatLngBounds? region}) async {
     final c = _controller;
     if (c == null || !_annLayersReady) return;
     try {
       if (_scope.settings.showUtmGrid) {
-        await c.setGeoJsonSource(_srcGrid, _linesFc(await _gridLineCoords(c)));
+        await c.setGeoJsonSource(
+          _srcGrid,
+          _linesFc(await _gridLineCoords(c, region: region)),
+        );
       } else {
         await c.setGeoJsonSource(_srcGrid, _emptyFc());
       }
@@ -898,8 +1058,27 @@ class MapScreenState extends State<MapScreen> {
   }
 
   /// Track line only — the per-fix path while recording. No disk I/O,
-  /// no other sources touched.
-  Future<void> _redrawTrack() async {
+  /// no other sources touched. Serialized (overlapping writes used to
+  /// arrive out of order and truncate the track visually) and throttled
+  /// to ~1 redraw/second: a long track was re-serialized over the
+  /// method channel on every GPS fix, which is O(n²) total work.
+  Future<void> _redrawTrack() => _trackGuard.run(_redrawTrackInner);
+
+  Future<void> _redrawTrackInner() async {
+    final now = DateTime.now();
+    final elapsed = now.difference(_lastTrackRedraw).inMilliseconds;
+    if (elapsed < 1000) {
+      // One pending redraw at most; it fires when the window opens.
+      _trackRedrawTimer ??= Timer(
+        Duration(milliseconds: 1000 - elapsed),
+        () {
+          _trackRedrawTimer = null;
+          _redrawTrack();
+        },
+      );
+      return;
+    }
+    _lastTrackRedraw = now;
     final c = _controller;
     if (c == null || !_annLayersReady) return;
     try {
@@ -981,7 +1160,10 @@ class MapScreenState extends State<MapScreen> {
     } catch (e) {
       debugPrint('Patok: _redrawFieldData failed: $e');
     }
-    if (mounted) setState(() {});
+    // No setState here: this only rewrites native sources, and every
+    // caller that changes Dart-visible state (measure points, mode)
+    // already rebuilds. The old unconditional setState rebuilt the
+    // whole screen on every waypoint/measure mutation and tab switch.
   }
 
   /// Full refresh: grid + field data. For init, style reloads, and tab
@@ -1006,8 +1188,8 @@ class MapScreenState extends State<MapScreen> {
       'patok_lyr_dxf_${id}_${ci}_line_$li';
   static String _dxfPointId(String id, int ci, int li) =>
       'patok_lyr_dxf_${id}_${ci}_pt_$li';
-  static String _dxfLabelId(String id, int ci) =>
-      'patok_lyr_dxf_${id}_${ci}_label';
+  static String _dxfLabelId(String id, int ci, [String suffix = '']) =>
+      'patok_lyr_dxf_${id}_${ci}_label$suffix';
 
   final Map<String, _DxfOverlay> _dxfOverlays = {};
 
@@ -1019,7 +1201,13 @@ class MapScreenState extends State<MapScreen> {
   /// (sources die with the style), so this also re-adds after reload.
   Future<void> _refreshDxfOverlaysInner() async {
     final c = _controller;
-    if (c == null || !_annLayersReady) return;
+    if (c == null) return;
+    // Was an early return when the annotation stack wasn't ready, which
+    // silently lost the refresh if it was requested during a style
+    // reload. Create the stack instead (a no-op when already ready);
+    // only give up if creation actually failed.
+    await _ensureAnnotationLayers();
+    if (!_annLayersReady) return;
     final want = <String, DxfImport>{
       for (final d in _scope.library.dxfImports)
         if (d.visible) d.id: d,
@@ -1031,13 +1219,23 @@ class MapScreenState extends State<MapScreen> {
       final existing = _dxfOverlays[entry.key];
       if (existing == null) {
         await _addDxfOverlay(entry.value);
-      } else if (!identical(existing.imp, entry.value)) {
-        // Same id, new model object (e.g. after a library reload):
-        // point at the new one and refresh its data.
+      } else {
+        // Same id, new model object (e.g. after a library reload), or
+        // state that changed while a sheet call joined this run: point
+        // at the new model and reconcile data/opacity. (The sheet
+        // mutates the model in place, so the refresh must compare
+        // applied state — not object identity — to notice the change.)
         existing.imp = entry.value;
-        await _updateDxfData(entry.key);
+        if (existing.appliedCadFingerprint !=
+            _cadLayersFingerprint(entry.value)) {
+          await _updateDxfData(entry.key);
+        }
+        if (existing.appliedOpacity != entry.value.opacity) {
+          await _applyDxfOpacity(entry.value);
+        }
       }
     }
+    _lastDxfFingerprint = _dxfFingerprint();
   }
 
   Future<void> _addDxfOverlay(DxfImport imp) async {
@@ -1053,8 +1251,7 @@ class MapScreenState extends State<MapScreen> {
     }
     final st = _DxfOverlay(imp)
       ..chunks = [
-        for (final c in chunkDxfFeatures(features))
-          _DxfChunk(c, _chunkColors(c)),
+        for (final c in chunkDxfFeatures(features)) _DxfChunk.analyze(c),
       ];
     // Register before adding layers so a mid-add failure still cleans up.
     _dxfOverlays[imp.id] = st;
@@ -1065,8 +1262,11 @@ class MapScreenState extends State<MapScreen> {
         await c.addGeoJsonSource(sid, _dxfChunkData(st, chunk));
         // Each layer goes directly below the annotation stack: later adds
         // end up above earlier ones, so add fills first, labels last.
-        for (var li = 0; li < chunk.colors.length; li++) {
-          final color = chunk.colors[li];
+        // Only create layers for (kind, color) pairs that exist in this
+        // chunk — a one-color drawing used to get a fill, line, and
+        // circle layer per color plus a label layer per chunk.
+        for (var li = 0; li < chunk.fillColors.length; li++) {
+          final color = chunk.fillColors[li];
           await c.addFillLayer(
             sid,
             _dxfFillId(imp.id, ci, li),
@@ -1079,19 +1279,23 @@ class MapScreenState extends State<MapScreen> {
           );
           st.layerIds.add(_dxfFillId(imp.id, ci, li));
         }
-        for (var li = 0; li < chunk.colors.length; li++) {
-          final color = chunk.colors[li];
+        for (var li = 0; li < chunk.lineColors.length; li++) {
+          final color = chunk.lineColors[li];
           await c.addLineLayer(
             sid,
             _dxfLineId(imp.id, ci, li),
-            LineLayerProperties(lineColor: color, lineWidth: 2.0),
+            LineLayerProperties(
+              lineColor: color,
+              lineWidth: 2.0,
+              lineOpacity: imp.opacity,
+            ),
             belowLayerId: _lyrGrid,
             filter: _dxfFilter('line', color),
           );
           st.layerIds.add(_dxfLineId(imp.id, ci, li));
         }
-        for (var li = 0; li < chunk.colors.length; li++) {
-          final color = chunk.colors[li];
+        for (var li = 0; li < chunk.pointColors.length; li++) {
+          final color = chunk.pointColors[li];
           await c.addCircleLayer(
             sid,
             _dxfPointId(imp.id, ci, li),
@@ -1100,27 +1304,36 @@ class MapScreenState extends State<MapScreen> {
               circleRadius: 5.0,
               circleStrokeWidth: 1.5,
               circleStrokeColor: '#000000',
+              circleOpacity: imp.opacity,
             ),
             belowLayerId: _lyrGrid,
             filter: _dxfFilter('point', color),
           );
           st.layerIds.add(_dxfPointId(imp.id, ci, li));
         }
-        await c.addSymbolLayer(
-          sid,
-          _dxfLabelId(imp.id, ci),
-          const SymbolLayerProperties(
-            textField: '{text}',
-            textSize: 12.0,
-            textColor: '#FFFFFF',
-            textHaloColor: '#000000',
-            textHaloWidth: 1.5,
-          ),
-          belowLayerId: _lyrGrid,
-          filter: _dxfFilter('label', null),
-        );
-        st.layerIds.add(_dxfLabelId(imp.id, ci));
+        // Labels: one symbol layer per text-height bucket that exists
+        // (see _DxfChunk.analyze), each at the import's opacity.
+        for (final ll in chunk.labelLayers) {
+          final lid = _dxfLabelId(imp.id, ci, ll.suffix);
+          await c.addSymbolLayer(
+            sid,
+            lid,
+            SymbolLayerProperties(
+              textField: '{text}',
+              textSize: ll.size,
+              textColor: '#FFFFFF',
+              textHaloColor: '#000000',
+              textHaloWidth: 1.5,
+              textOpacity: imp.opacity,
+            ),
+            belowLayerId: _lyrGrid,
+            filter: ll.filter,
+          );
+          st.layerIds.add(lid);
+        }
       }
+      st.appliedOpacity = imp.opacity;
+      st.appliedCadFingerprint = _cadLayersFingerprint(imp);
     } catch (e) {
       debugPrint('Patok: adding DXF overlay failed: $e');
       await _removeDxfOverlay(imp.id);
@@ -1135,19 +1348,6 @@ class MapScreenState extends State<MapScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
-  }
-
-  static List<String> _chunkColors(
-    Map<String, List<Map<String, dynamic>>> byCadLayer,
-  ) {
-    final set = <String>{};
-    for (final feats in byCadLayer.values) {
-      for (final f in feats) {
-        final props = f['properties'] as Map;
-        if (props['kind'] != 'label') set.add(props['color'] as String);
-      }
-    }
-    return set.toList()..sort();
   }
 
   static List<dynamic> _dxfFilter(String kind, String? color) => [
@@ -1196,19 +1396,26 @@ class MapScreenState extends State<MapScreen> {
   }
 
   /// Rewrites one import's chunk sources after CAD-layer toggles.
-  Future<void> _updateDxfData(String id) async {
+  /// With [onlyCadLayer], only chunks containing that layer are
+  /// rewritten — a toggle used to re-send every chunk of the drawing.
+  Future<void> _updateDxfData(String id, {String? onlyCadLayer}) async {
     final c = _controller;
     final st = _dxfOverlays[id];
     if (c == null || st == null) return;
     try {
-      for (var ci = 0; ci < st.chunks.length; ci++) {
-        await c.setGeoJsonSource(
-          _dxfSourceId(id, ci),
-          _dxfChunkData(st, st.chunks[ci]),
-        );
-      }
+      await Future.wait([
+        for (var ci = 0; ci < st.chunks.length; ci++)
+          if (onlyCadLayer == null ||
+              st.chunks[ci].byCadLayer.containsKey(onlyCadLayer))
+            c.setGeoJsonSource(
+              _dxfSourceId(id, ci),
+              _dxfChunkData(st, st.chunks[ci]),
+            ),
+      ]);
+      st.appliedCadFingerprint = _cadLayersFingerprint(st.imp);
     } catch (e) {
       debugPrint('Patok: DXF data update failed: $e');
+      _dxfError('Could not update the drawing "${st.imp.name}".');
     }
   }
 
@@ -1218,27 +1425,34 @@ class MapScreenState extends State<MapScreen> {
     final st = _dxfOverlays[imp.id];
     if (c == null || st == null) return;
     try {
-      for (var ci = 0; ci < st.chunks.length; ci++) {
-        final chunk = st.chunks[ci];
-        for (var li = 0; li < chunk.colors.length; li++) {
-          await c.setLayerProperties(
-            _dxfFillId(imp.id, ci, li),
-            FillLayerProperties(fillOpacity: 0.35 * imp.opacity),
-          );
-          await c.setLayerProperties(
-            _dxfLineId(imp.id, ci, li),
-            LineLayerProperties(lineOpacity: imp.opacity),
-          );
-          await c.setLayerProperties(
-            _dxfPointId(imp.id, ci, li),
-            CircleLayerProperties(circleOpacity: imp.opacity),
-          );
-        }
-        await c.setLayerProperties(
-          _dxfLabelId(imp.id, ci),
-          SymbolLayerProperties(textOpacity: imp.opacity),
-        );
-      }
+      // The per-layer calls are independent: dispatch them together
+      // instead of awaiting each in turn (a mid-loop failure used to
+      // leave the layers at mixed opacities).
+      await Future.wait([
+        for (var ci = 0; ci < st.chunks.length; ci++) ...[
+          for (var li = 0; li < st.chunks[ci].fillColors.length; li++)
+            c.setLayerProperties(
+              _dxfFillId(imp.id, ci, li),
+              FillLayerProperties(fillOpacity: 0.35 * imp.opacity),
+            ),
+          for (var li = 0; li < st.chunks[ci].lineColors.length; li++)
+            c.setLayerProperties(
+              _dxfLineId(imp.id, ci, li),
+              LineLayerProperties(lineOpacity: imp.opacity),
+            ),
+          for (var li = 0; li < st.chunks[ci].pointColors.length; li++)
+            c.setLayerProperties(
+              _dxfPointId(imp.id, ci, li),
+              CircleLayerProperties(circleOpacity: imp.opacity),
+            ),
+          for (final ll in st.chunks[ci].labelLayers)
+            c.setLayerProperties(
+              _dxfLabelId(imp.id, ci, ll.suffix),
+              SymbolLayerProperties(textOpacity: imp.opacity),
+            ),
+        ],
+      ]);
+      st.appliedOpacity = imp.opacity;
     } catch (e) {
       debugPrint('Patok: DXF opacity failed: $e');
     }
@@ -1249,33 +1463,71 @@ class MapScreenState extends State<MapScreen> {
     final c = _controller;
     if (c == null || imp.bounds.length != 4) return;
     final b = imp.bounds;
-    await c.animateCamera(
-      CameraUpdate.newLatLngBounds(
-        LatLngBounds(
-          southwest: LatLng(b[1], b[0]),
-          northeast: LatLng(b[3], b[2]),
+    if (b.any((v) => !v.isFinite) ||
+        b[2] - b[0] < 1e-9 ||
+        b[3] - b[1] < 1e-9) {
+      // Degenerate/collapsed bounds (e.g. a local grid calibrated on
+      // two identical points): the camera update would throw an
+      // unhandled async error. Tell the user instead.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Could not zoom to "${imp.name}": the drawing has no usable extent.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+    try {
+      await c.animateCamera(
+        CameraUpdate.newLatLngBounds(
+          LatLngBounds(
+            southwest: LatLng(b[1], b[0]),
+            northeast: LatLng(b[3], b[2]),
+          ),
+          left: 24,
+          top: 24,
+          right: 24,
+          bottom: 24,
         ),
-        left: 24,
-        top: 24,
-        right: 24,
-        bottom: 24,
-      ),
-    );
+      );
+    } catch (e) {
+      debugPrint('Patok: zoom to DXF failed: $e');
+    }
   }
 
   /// Called by the layers sheet when a CAD layer is toggled.
+  /// Serialized through the DXF guard so a toggle can't race a
+  /// refresh on the same source ids.
   Future<void> onDxfCadLayerChanged(
+    DxfImport imp,
+    String cadLayer,
+    bool visible,
+  ) =>
+      _dxfGuard.run(
+        () => _onDxfCadLayerChangedInner(imp, cadLayer, visible),
+      );
+
+  Future<void> _onDxfCadLayerChangedInner(
     DxfImport imp,
     String cadLayer,
     bool visible,
   ) async {
     imp.cadLayers[cadLayer] = visible;
     await _scope.library.save();
-    await _updateDxfData(imp.id);
+    await _updateDxfData(imp.id, onlyCadLayer: cadLayer);
   }
 
   /// Called by the layers sheet for import-level visibility/opacity.
-  Future<void> onDxfImportChanged(DxfImport imp) async {
+  /// Serialized through the DXF guard for the same reason: a toggle
+  /// mid-refresh used to add a source the refresh then re-added
+  /// ("Source ... already exists").
+  Future<void> onDxfImportChanged(DxfImport imp) =>
+      _dxfGuard.run(() => _onDxfImportChangedInner(imp));
+
+  Future<void> _onDxfImportChangedInner(DxfImport imp) async {
     await _scope.library.save();
     if (imp.visible && !_dxfOverlays.containsKey(imp.id)) {
       await _addDxfOverlay(imp);
@@ -1331,13 +1583,38 @@ class MapScreenState extends State<MapScreen> {
   /// Public cancel for cross-tab flows (see [isPicking]).
   void cancelPick() => _cancelPick();
 
+  // Cached UTM projection for the grid lines (re-parsed on every camera
+  // idle before; the zone only changes when the user pans far).
+  proj4.Projection? _cachedGridUtm;
+  int _cachedGridZone = -1;
+  bool _cachedGridSouth = false;
+
+  proj4.Projection _gridUtmFor(int zone, bool south) {
+    final cached = _cachedGridUtm;
+    if (cached != null &&
+        _cachedGridZone == zone &&
+        _cachedGridSouth == south) {
+      return cached;
+    }
+    final utm = proj4.Projection.parse(
+      '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
+      '${south ? ' +south' : ''}',
+    );
+    _cachedGridUtm = utm;
+    _cachedGridZone = zone;
+    _cachedGridSouth = south;
+    return utm;
+  }
+
   /// UTM grid line coordinates ([lon, lat] pairs) for the visible region.
   /// Line spacing follows the visible width. Returns empty when the region
-  /// is unknown.
+  /// is unknown. [region] is the visible region already fetched by the
+  /// caller; fetched here when null.
   Future<List<List<List<double>>>> _gridLineCoords(
-    MapLibreMapController c,
-  ) async {
-    final region = await c.getVisibleRegion();
+    MapLibreMapController c, {
+    LatLngBounds? region,
+  }) async {
+    region ??= await c.getVisibleRegion();
     final midLat =
         (region.northeast.latitude + region.southwest.latitude) / 2;
     // Visible width in meters (replaces the old zoom-based tiers — the
@@ -1362,10 +1639,7 @@ class MapScreenState extends State<MapScreen> {
     final centerLat =
         (region.northeast.latitude + region.southwest.latitude) / 2;
     final zone = ((centerLon + 180) / 6).floor() + 1;
-    final utm = proj4.Projection.parse(
-      '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
-      '${centerLat < 0 ? ' +south' : ''}',
-    );
+    final utm = _gridUtmFor(zone, centerLat < 0);
     math.Point<double> toUtm(double lon, double lat) {
       final p = proj4.Projection.WGS84.transform(
         utm,
@@ -1635,7 +1909,7 @@ class MapScreenState extends State<MapScreen> {
     if (center == null || !mounted) return;
     final name =
         await _askWaypointName(context, 'Waypoint ${_wpsCache.length + 1}');
-    if (name == null || !mounted) return;
+    if (name == null || name.trim().isEmpty || !mounted) return;
     _wpsCache.add(Waypoint(
       id: _uuid.v4(),
       name: name,
@@ -1657,21 +1931,26 @@ class MapScreenState extends State<MapScreen> {
     final ctrl = TextEditingController(text: hint);
     return showDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Waypoint name'),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: const InputDecoration(hintText: 'Name'),
+      builder: (ctx) => ValueListenableBuilder<TextEditingValue>(
+        valueListenable: ctrl,
+        builder: (ctx, value, _) => AlertDialog(
+          title: const Text('Waypoint name'),
+          content: TextField(
+            controller: ctrl,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Name'),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel')),
+            FilledButton(
+                onPressed: value.text.trim().isEmpty
+                    ? null
+                    : () => Navigator.pop(ctx, ctrl.text.trim()),
+                child: const Text('Save')),
+          ],
         ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-              child: const Text('Save')),
-        ],
       ),
     );
   }
@@ -1709,7 +1988,14 @@ class MapScreenState extends State<MapScreen> {
 
   Future<void> _saveMeasurement() async {
     if (_measurePoints.length < 2) return;
-    final name = 'Measurement ${_measurePoints.length} pts';
+    // Same point count would otherwise produce identical names.
+    final base = 'Measurement ${_measurePoints.length} pts';
+    var name = base;
+    var n = 2;
+    while (_msCache.any((m) => m.name == name)) {
+      name = '$base ($n)';
+      n++;
+    }
     _msCache.add(
       Measurement(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -1737,7 +2023,7 @@ class MapScreenState extends State<MapScreen> {
       setState(() => _followMe = false);
       return;
     }
-    var pos = _lastGps ?? await _scope.locationService.currentPosition();
+    var pos = _lastGps.value ?? await _scope.locationService.currentPosition();
     if (pos == null) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -1757,10 +2043,6 @@ class MapScreenState extends State<MapScreen> {
   }
 
   // ----------------------------------------------------------- readout
-
-  void _onSatellitesChanged() {
-    if (mounted) setState(() {});
-  }
 
   /// Meters per screen pixel derived from the *visible region* (fresh
   /// method-channel data), never from `controller.cameraPosition` — the
@@ -1784,11 +2066,22 @@ class MapScreenState extends State<MapScreen> {
 
   DateTime _lastMppRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
-  Future<void> _refreshMetersPerPx() async {
+  /// Visible region, or null when the map isn't ready / the call fails.
+  Future<LatLngBounds?> _visibleRegion() async {
+    final c = _controller;
+    if (c == null) return null;
+    try {
+      return await c.getVisibleRegion();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _refreshMetersPerPx({LatLngBounds? region}) async {
     final c = _controller;
     if (c == null || !mounted) return;
     try {
-      final region = await c.getVisibleRegion();
+      region ??= await c.getVisibleRegion();
       final mpp = _metersPerPixel(region);
       if (mpp > 0) _metersPerPx.value = mpp;
     } catch (_) {}
@@ -1799,7 +2092,7 @@ class MapScreenState extends State<MapScreen> {
     // center is only a fallback before the first fix. (The plugin's
     // cached cameraPosition can lag behind the actual camera, which
     // once showed a stale default-Jakarta readout.)
-    final gps = _lastGps;
+    final gps = _lastGps.value;
     final double lon, lat;
     if (gps != null) {
       lon = gps.longitude;
@@ -1814,7 +2107,10 @@ class MapScreenState extends State<MapScreen> {
     final text = fmt == 'utm'
         ? formatUtm(lon, lat)
         : '${lat.toStringAsFixed(5)}, ${lon.toStringAsFixed(5)}';
-    if (mounted && text != _coordText) setState(() => _coordText = text);
+    // The GPS bar listens to this notifier directly (ValueNotifier only
+    // notifies on change, like the old text comparison): no
+    // whole-screen setState per GPS fix.
+    _coordText.value = text;
   }
 
   // ----------------------------------------------------------------- ui
@@ -1853,16 +2149,20 @@ class MapScreenState extends State<MapScreen> {
                   _refreshMetersPerPx();
                 }
               },
-              onCameraIdle: () {
-                _refreshMetersPerPx();
+              onCameraIdle: () async {
+                // Fetch the visible region once and share it: the
+                // scale-bar refresh, grid redraw, and detail render
+                // used to each make their own method-channel round-trip.
+                final region = await _visibleRegion();
+                _refreshMetersPerPx(region: region);
                 _updateCoordReadout();
-                _redrawGrid();
+                _redrawGrid(region: region);
                 // Settle-debounce: a quick second gesture would cancel an
                 // in-flight render anyway, so wait briefly and render once.
                 _detailDebounce?.cancel();
                 _detailDebounce = Timer(
                   const Duration(milliseconds: 250),
-                  _maybeUpdateDetailOverlay,
+                  () => _maybeUpdateDetailOverlay(region: region),
                 );
               },
             )
@@ -1909,7 +2209,12 @@ class MapScreenState extends State<MapScreen> {
               child: ValueListenableBuilder<bool>(
                 valueListenable: _trackRecorder.isRecording,
                 builder: (context, recording, _) =>
-                    recording ? _RecPill(onTap: widget.onOpenField) : const SizedBox.shrink(),
+                    recording
+                        ? _RecPill(
+                            onTap: widget.onOpenField,
+                            visible: _tabVisible,
+                          )
+                        : const SizedBox.shrink(),
               ),
             ),
           ),
@@ -2131,9 +2436,10 @@ class MapScreenState extends State<MapScreen> {
                         : _GpsBar(
                             coordText: _coordText,
                             position: _lastGps,
-                            satellites: _gnssService.satellites.value,
+                            satellites: _gnssService.satellites,
                             busy: _busy,
                             status: _status,
+                            visible: _tabVisible,
                           ),
                   ],
                 ),
@@ -2153,12 +2459,21 @@ class _GpsBar extends StatefulWidget {
     required this.satellites,
     required this.busy,
     this.status,
+    required this.visible,
   });
-  final String coordText;
-  final Position? position;
-  final (int, int)? satellites;
+
+  /// Notifiers, not snapshots: the bar rebuilds itself (via the
+  /// AnimatedBuilder below) when the fix, satellites, or readout text
+  /// change — the map screen no longer rebuilds per GPS fix.
+  final ValueNotifier<String> coordText;
+  final ValueNotifier<Position?> position;
+  final ValueNotifier<(int, int)?> satellites;
   final bool busy;
   final String? status;
+
+  /// Whether the Map tab is visible; the fix-age timer only ticks
+  /// while visible (this screen is never disposed).
+  final ValueNotifier<bool> visible;
 
   @override
   State<_GpsBar> createState() => _GpsBarState();
@@ -2170,101 +2485,126 @@ class _GpsBarState extends State<_GpsBar> {
   @override
   void initState() {
     super.initState();
-    // Refresh the "fix age" label while the fix goes stale.
-    _ageTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted && widget.position != null) setState(() {});
-    });
+    // Refresh the "fix age" label while the fix goes stale — only
+    // while the Map tab is visible.
+    widget.visible.addListener(_syncAgeTimer);
+    _syncAgeTimer();
+  }
+
+  void _syncAgeTimer() {
+    if (widget.visible.value) {
+      _ageTimer ??= Timer.periodic(const Duration(seconds: 5), (_) {
+        if (mounted && widget.position.value != null) setState(() {});
+      });
+    } else {
+      _ageTimer?.cancel();
+      _ageTimer = null;
+    }
   }
 
   @override
   void dispose() {
+    widget.visible.removeListener(_syncAgeTimer);
     _ageTimer?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    final pos = widget.position;
-    final stats = <String>[];
-    if (pos != null) {
-      stats.add('ELEV ${pos.altitude.toStringAsFixed(0)}m');
-      final vAcc = pos.altitudeAccuracy;
-      final vTxt = pos.hasAltitudeAccuracy && vAcc.isFinite
-          ? ' V±${vAcc.toStringAsFixed(0)}m'
-          : '';
-      stats.add('H±${pos.accuracy.toStringAsFixed(0)}m$vTxt');
-      final sat = widget.satellites;
-      if (sat != null) stats.add('SAT ${sat.$1}/${sat.$2}');
-      final kmh = pos.speed * 3.6;
-      if (kmh.isFinite && kmh >= 0.5) stats.add('${kmh.toStringAsFixed(0)} km/h');
-      final age = DateTime.now().difference(pos.timestamp);
-      stats.add(_formatAge(age));
-    }
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        color: PatokTheme.surface.withValues(alpha: 0.92),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        widget.coordText,
+        widget.position,
+        widget.satellites,
+      ]),
+      builder: (context, _) {
+        final textTheme = Theme.of(context).textTheme;
+        final pos = widget.position.value;
+        final stats = <String>[];
+        if (pos != null) {
+          stats.add('ELEV ${pos.altitude.toStringAsFixed(0)}m');
+          final vAcc = pos.altitudeAccuracy;
+          final vTxt = pos.hasAltitudeAccuracy && vAcc.isFinite
+              ? ' V±${vAcc.toStringAsFixed(0)}m'
+              : '';
+          stats.add('H±${pos.accuracy.toStringAsFixed(0)}m$vTxt');
+          final sat = widget.satellites.value;
+          if (sat != null) stats.add('SAT ${sat.$1}/${sat.$2}');
+          final kmh = pos.speed * 3.6;
+          if (kmh.isFinite && kmh >= 0.5) {
+            stats.add('${kmh.toStringAsFixed(0)} km/h');
+          }
+          final age = DateTime.now().difference(pos.timestamp);
+          stats.add(_formatAge(age));
+        }
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: PatokTheme.surface.withValues(alpha: 0.92),
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (widget.busy)
-                const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              else
-                const Icon(Icons.place, color: PatokTheme.accent, size: 18),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  widget.status ?? widget.coordText,
-                  style: textTheme.bodyMedium?.copyWith(
+              Row(
+                children: [
+                  if (widget.busy)
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  else
+                    const Icon(Icons.place, color: PatokTheme.accent, size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      widget.status ?? widget.coordText.value,
+                      style: textTheme.bodyMedium?.copyWith(
+                        fontFamily: 'monospace',
+                        fontFamilyFallback: const ['monospace'],
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.copy, size: 18),
+                    color: PatokTheme.onSurfaceDim,
+                    tooltip: 'Copy coordinates',
+                    constraints: const BoxConstraints(),
+                    padding: EdgeInsets.zero,
+                    onPressed: () {
+                      Clipboard.setData(
+                        ClipboardData(text: widget.coordText.value),
+                      );
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Coordinates copied'),
+                          duration: Duration(seconds: 1),
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
+              if (stats.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  stats.join(' · '),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: textTheme.bodySmall?.copyWith(
+                    color: PatokTheme.onSurfaceDim,
                     fontFamily: 'monospace',
                     fontFamilyFallback: const ['monospace'],
                   ),
                 ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.copy, size: 18),
-                color: PatokTheme.onSurfaceDim,
-                tooltip: 'Copy coordinates',
-                constraints: const BoxConstraints(),
-                padding: EdgeInsets.zero,
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: widget.coordText));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Coordinates copied'),
-                      duration: Duration(seconds: 1),
-                    ),
-                  );
-                },
-              ),
+              ],
             ],
           ),
-          if (stats.isNotEmpty) ...[
-            const SizedBox(height: 4),
-            Text(
-              stats.join(' · '),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: textTheme.bodySmall?.copyWith(
-                color: PatokTheme.onSurfaceDim,
-                fontFamily: 'monospace',
-                fontFamilyFallback: const ['monospace'],
-              ),
-            ),
-          ],
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -2290,17 +2630,140 @@ class _DxfOverlay {
 
   /// MapLibre layer ids created for this import (for removal).
   final List<String> layerIds = [];
+
+  /// Opacity actually applied to the native layers, and the CAD-layer
+  /// fingerprint the chunk sources were built from. The refresh
+  /// reconciler compares these against the model so a sheet change
+  /// that joined an in-flight refresh isn't silently lost.
+  double appliedOpacity = 1.0;
+  int appliedCadFingerprint = 0;
 }
 
 /// One size-bounded slice of an import's features.
 class _DxfChunk {
-  _DxfChunk(this.byCadLayer, this.colors);
+  _DxfChunk(
+    this.byCadLayer,
+    this.fillColors,
+    this.lineColors,
+    this.pointColors,
+    this.labelLayers,
+  );
 
   /// CAD layer -> features in this chunk (all layers, unfiltered).
   final Map<String, List<Map<String, dynamic>>> byCadLayer;
 
-  /// Distinct non-label colors in this chunk (selects layer suffixes).
-  final List<String> colors;
+  /// Distinct colors present per kind — only layers for these are
+  /// created (a one-color drawing no longer gets a fill, line, and
+  /// circle layer per color).
+  final List<String> fillColors;
+  final List<String> lineColors;
+  final List<String> pointColors;
+
+  /// Label layers to create: one per text-height bucket that exists.
+  /// Empty when the chunk has no labels.
+  final List<_DxfLabelLayer> labelLayers;
+
+  /// Derives the per-kind colors and label-height buckets from the
+  /// chunk's features. Label heights come from the cached features
+  /// ('height' property, drawing units); when absent, all labels share
+  /// one layer at the historic 12.0 size.
+  static _DxfChunk analyze(
+    Map<String, List<Map<String, dynamic>>> byCadLayer,
+  ) {
+    final kindColors = <String, Set<String>>{};
+    final heights = <double>[];
+    var hasLabels = false;
+    for (final feats in byCadLayer.values) {
+      for (final f in feats) {
+        final props = f['properties'] as Map;
+        final kind = props['kind'] as String?;
+        if (kind == null) continue;
+        if (kind == 'label') {
+          hasLabels = true;
+          final h = (props['height'] as num?)?.toDouble();
+          if (h != null && h.isFinite && h > 0) heights.add(h);
+        } else {
+          (kindColors[kind] ??= {}).add(props['color'] as String);
+        }
+      }
+    }
+    List<String> sorted(String kind) =>
+        (kindColors[kind] ?? <String>{}).toList()..sort();
+    final labelLayers = <_DxfLabelLayer>[];
+    if (hasLabels) {
+      if (heights.isEmpty) {
+        // No height data (e.g. caches written before heights were
+        // stored): a single layer at the historic size.
+        labelLayers.add(
+          const _DxfLabelLayer('', 12.0, [
+            'all',
+            ['==', ['get', 'kind'], 'label'],
+          ]),
+        );
+      } else {
+        // Buckets relative to the median label height: CAD text sizes
+        // vary per drawing, so absolute sizes would be meaningless.
+        heights.sort();
+        final med = heights[heights.length ~/ 2];
+        final low = med * 0.7, high = med * 1.4;
+        if (heights.any((h) => h < low)) {
+          labelLayers.add(
+            _DxfLabelLayer('_s', 10.0, [
+              'all',
+              ['==', ['get', 'kind'], 'label'],
+              ['<', ['get', 'height'], low],
+            ]),
+          );
+        }
+        // Medium: the median band, plus labels without height data.
+        labelLayers.add(
+          _DxfLabelLayer('', 12.0, [
+            'all',
+            ['==', ['get', 'kind'], 'label'],
+            [
+              'any',
+              ['!', ['has', 'height']],
+              [
+                'all',
+                ['>=', ['get', 'height'], low],
+                ['<=', ['get', 'height'], high],
+              ],
+            ],
+          ]),
+        );
+        if (heights.any((h) => h > high)) {
+          labelLayers.add(
+            _DxfLabelLayer('_l', 18.0, [
+              'all',
+              ['==', ['get', 'kind'], 'label'],
+              ['>', ['get', 'height'], high],
+            ]),
+          );
+        }
+      }
+    }
+    return _DxfChunk(
+      byCadLayer,
+      sorted('fill'),
+      sorted('line'),
+      sorted('point'),
+      labelLayers,
+    );
+  }
+}
+
+/// One symbol layer for a text-height bucket of DXF labels.
+class _DxfLabelLayer {
+  const _DxfLabelLayer(this.suffix, this.size, this.filter);
+
+  /// Layer-id suffix ('' = medium/default, '_s', '_l').
+  final String suffix;
+
+  /// Text size in points.
+  final double size;
+
+  /// MapLibre filter selecting this bucket's labels.
+  final List<dynamic> filter;
 }
 
 /// Dynamic scale bar: picks a nice round distance for ~90px at the
@@ -2808,8 +3271,12 @@ class _DetailTarget {
 /// Live track-recording pill shown at the top of the map while recording.
 /// Taps jump to the Field tab (where stop/save lives).
 class _RecPill extends StatefulWidget {
-  const _RecPill({required this.onTap});
+  const _RecPill({required this.onTap, required this.visible});
   final VoidCallback? onTap;
+
+  /// Whether the Map tab is visible; the 1 s clock only ticks while
+  /// visible (this screen is never disposed).
+  final ValueNotifier<bool> visible;
 
   @override
   State<_RecPill> createState() => _RecPillState();
@@ -2821,13 +3288,24 @@ class _RecPillState extends State<_RecPill> {
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
-    });
+    widget.visible.addListener(_syncTimer);
+    _syncTimer();
+  }
+
+  void _syncTimer() {
+    if (widget.visible.value) {
+      _timer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
   }
 
   @override
   void dispose() {
+    widget.visible.removeListener(_syncTimer);
     _timer?.cancel();
     super.dispose();
   }

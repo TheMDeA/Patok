@@ -3,7 +3,7 @@
 All notable changes to Patok are documented here. Entries are user-facing
 and concise.
 
-## [1.0.7] - 2026-11-17
+## [1.1.0] - 2026-11-17
 
 ### Fixed
 - Fixed a random "page(s) failed to render" error (Source already
@@ -14,6 +14,90 @@ and concise.
 - DXF drawings with many entities now appear on the map (large drawings
   are split into chunks that fit the map channel); a drawing that still
   fails to display now shows a message instead of failing silently
+- A damaged entry in the library no longer wipes the whole library —
+  bad entries are skipped and the rest are kept; library, waypoint,
+  and measurement files are now saved safely, so a crash while saving
+  can't corrupt them
+- Deleting a map or drawing can no longer destroy the only copy if the
+  backup step fails; a failed delete or restore now says so instead of
+  silently losing the file
+- Saved local grids are no longer wiped out by one damaged entry, and a
+  grid built from two identical real-world points is now rejected
+  instead of collapsing the drawing to a point
+- A map with one damaged page no longer blocks the whole import — the
+  good pages still load, and skipped pages are named; a map with a
+  broken coordinate system now fails with a clear error instead of
+  landing in the wrong place
+- TerraGo maps that store their positioning numbers as text now import
+  instead of failing; small maps no longer get their positioning misread
+- Drawings with bad coordinates, unusual characters, or encodings no
+  longer fail the whole import, and failed imports no longer leave
+  orphan files behind
+- Nested drawing blocks now appear, and blocks with an offset base
+  point land in the right place; separate filled areas in a hatch now
+  show as separate shapes instead of disappearing
+- Curved polylines now show their curves, spline drawings appear
+  instead of being skipped, and multi-line text labels show in full
+  without formatting codes
+- Map labels now use their real text size, and layers switched off in
+  the CAD file stay hidden
+- The UTM zone you pick is kept when you return from picking a point on
+  the map; saving a grid with an existing name now asks before
+  replacing it
+- DXF drawings keep their opacity on lines, points, and labels after
+  reopening the map; very long contour lines no longer break the map
+  overlay
+- Layers-sheet toggles no longer clash with map refreshes, fixing
+  random "source already exists" render failures; opening a drawing
+  now tells you if the map isn't ready instead of doing nothing
+- Drawings with broken or collapsed extents no longer crash the zoom —
+  you get a message instead
+- Waypoints and tracks can no longer be saved with an empty name, and
+  measurements no longer share the same name; a failed save now reports
+  an error instead of failing silently
+- GPS now stops when the map isn't in use, saving battery; the
+  satellite count now appears on first launch instead of only after a
+  restart
+- Opening a map you've already opened is instant instead of
+  re-rendering, and returning to the map only re-renders what actually
+  changed
+- The Storage screen now counts DXF drawings and their caches in the
+  total, and the library loads faster without starting every map
+  preview at once
+- Track recording now keeps recording while the phone is locked, with a
+  notification showing that a track is being recorded
+- A download that stops halfway no longer bricks the update — it is
+  detected and re-downloaded instead of being treated as finished, and
+  a download can now be cancelled from the update sheet
+- A stalled update download no longer hangs forever; a failed update
+  check no longer hides updates for a whole day
+- The update sheet now tells you when an install was cancelled instead
+  of claiming success, and explains the unknown-sources step instead of
+  showing a failure
+- Files shared to Patok from another app now copy in the background, so
+  large maps no longer freeze the app; a failed share now says so,
+  sharing several files at once works, and the library no longer
+  imports the same shared file twice after the app restarts
+- A release build accidentally signed with debug keys can no longer be
+  published — the build now fails the release instead
+
+### Performance
+- Importing large DXF drawings no longer freezes the app — parsing and
+  projection run in the background
+- The map screen no longer rebuilds on every GPS fix, and the track
+  line updates at most once a second while recording, so long tracks
+  stay smooth
+- CAD-layer toggles update instantly instead of re-sending the whole
+  drawing
+- Large map files decode faster and use less memory while opening;
+  waypoint averaging is faster on long sessions and map previews
+  encode faster with less memory
+- Update downloads report progress less often, so the sheet stays
+  smooth, and the shown download speed is now the real rate on resumed
+  downloads
+- Large DXF drawings now import with far less memory — the file is read
+  and parsed as a stream instead of being loaded whole several times
+  over
 
 ## [1.0.5] - 2026-10-18
 

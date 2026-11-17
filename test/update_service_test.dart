@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -6,6 +7,29 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:patok/src/update_service.dart';
+
+/// A fake HTTP client returning a canned [http.StreamedResponse].
+class _FakeClient extends http.BaseClient {
+  _FakeClient(this.response);
+  final http.StreamedResponse response;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async =>
+      response;
+}
+
+/// Minimal fake APK bytes: ZIP local header + filler + end-of-central-
+/// directory record. With [truncated], the EOCD record is omitted, so the
+/// file looks like a download that stopped halfway.
+Uint8List _fakeApk({bool truncated = false}) {
+  final buf = <int>[0x50, 0x4B, 0x03, 0x04]; // PK\x03\x04
+  buf.addAll(List.filled(100, 0));
+  if (!truncated) {
+    buf.addAll([0x50, 0x4B, 0x05, 0x06]); // PK\x05\x06
+    buf.addAll(List.filled(18, 0)); // EOCD record
+  }
+  return Uint8List.fromList(buf);
+}
 
 void main() {
   group('isNewerVersion', () {
@@ -108,6 +132,84 @@ group('downloadApk resume', () {
         onProgress: (_) {}, client: client);
     final file = File('${dir.path}/patok-9.9.9.apk');
     expect(await file.readAsBytes(), full);
+  });
+});
+
+group('download completion, cancellation and cache (#7, #21)', () {
+  const channel = MethodChannel('plugins.flutter.io/path_provider');
+  late Directory dir;
+
+  setUp(() async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    dir = await Directory.systemTemp.createTemp('patok_dl_test');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'getTemporaryDirectory') return dir.path;
+      return null;
+    });
+  });
+
+  tearDown(() async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
+    await dir.delete(recursive: true);
+  });
+
+  test('a truncated stream throws and never becomes the cached APK',
+      () async {
+    // MockClient reports content-length from the body, so a lying
+    // content-length needs a hand-built StreamedResponse.
+    final bytes = List.generate(40, (i) => i % 256);
+    final client = _FakeClient(
+      http.StreamedResponse(Stream.value(bytes), 200, contentLength: 100),
+    );
+    await expectLater(
+      downloadApk('https://example.com/app.apk', '9.9.9',
+          onProgress: (_) {}, client: client),
+      throwsA(isA<HttpException>()),
+    );
+    // The .part file stays (resumable), but no .apk is ever created.
+    expect(await File('${dir.path}/patok-9.9.9.apk').exists(), isFalse);
+    expect(await File('${dir.path}/patok-9.9.9.apk.part').exists(), isTrue);
+  });
+
+  test('cancelling between chunks throws DownloadCancelled', () async {
+    final controller = StreamController<List<int>>();
+    final client = _FakeClient(
+      http.StreamedResponse(controller.stream, 200, contentLength: 1000),
+    );
+    var cancelled = false;
+    final future = downloadApk('https://example.com/app.apk', '9.9.9',
+        onProgress: (_) {}, isCancelled: () => cancelled, client: client);
+    controller.add(List.filled(100, 0));
+    await Future<void>.delayed(Duration.zero);
+    cancelled = true;
+    controller.add(List.filled(100, 0));
+    await controller.close();
+    await expectLater(future, throwsA(isA<DownloadCancelled>()));
+    // The partial download is kept for a later resume.
+    expect(await File('${dir.path}/patok-9.9.9.apk.part').exists(), isTrue);
+  });
+
+  test('no file is not cached', () async {
+    expect(await isApkCached('9.9.9'), isFalse);
+  });
+
+  test('a valid APK is cached', () async {
+    await File('${dir.path}/patok-9.9.9.apk').writeAsBytes(_fakeApk());
+    expect(await isApkCached('9.9.9'), isTrue);
+  });
+
+  test('a truncated APK is not cached', () async {
+    await File('${dir.path}/patok-9.9.9.apk')
+        .writeAsBytes(_fakeApk(truncated: true));
+    expect(await isApkCached('9.9.9'), isFalse);
+  });
+
+  test('a non-ZIP file is not cached', () async {
+    await File('${dir.path}/patok-9.9.9.apk')
+        .writeAsString('not an apk at all, just text');
+    expect(await isApkCached('9.9.9'), isFalse);
   });
 });
 }

@@ -128,6 +128,7 @@ class GeoMap {
     this.visible = true,
     this.opacity = 1.0,
     this.isFavorite = false,
+    this.skippedPages = const [],
     DateTime? addedAt,
   }) : addedAt = addedAt ?? DateTime.now();
 
@@ -142,6 +143,12 @@ class GeoMap {
   bool visible;
   double opacity;
   bool isFavorite;
+
+  /// Pages that were skipped during import because their
+  /// georeferencing was broken, e.g. `Page 1: viewport: Singular
+  /// system...`. Surfaced on the import result so a skipped page is
+  /// never silently dropped.
+  final List<String> skippedPages;
   final DateTime addedAt;
 
   int get georeferencedPages => pages.length;
@@ -154,6 +161,7 @@ class GeoMap {
         'visible': visible,
         'opacity': opacity,
         'isFavorite': isFavorite,
+        'skippedPages': skippedPages,
         'addedAt': addedAt.toIso8601String(),
       };
 
@@ -167,6 +175,10 @@ class GeoMap {
         visible: j['visible'] as bool? ?? true,
         opacity: (j['opacity'] as num?)?.toDouble() ?? 1.0,
         isFavorite: j['isFavorite'] as bool? ?? false,
+        skippedPages: (j['skippedPages'] as List?)
+                ?.map((e) => e as String)
+                .toList() ??
+            const [],
         addedAt: DateTime.parse(j['addedAt'] as String),
       );
 

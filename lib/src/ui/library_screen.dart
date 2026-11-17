@@ -11,6 +11,48 @@ import 'dxf_import_screen.dart';
 import 'import_screen.dart';
 import 'map_info_sheet.dart';
 
+/// Moves each existing file in [paths] to `<path>.undo` and returns the
+/// backup files created (empty when none of the files existed). Returns
+/// null if any move failed — files already moved are put back first, so
+/// the caller can abort a delete without losing data.
+Future<List<File>?> moveAsideForUndo(List<String> paths) async {
+  final moved = <File>[];
+  for (final p in paths) {
+    final f = File(p);
+    if (!await f.exists()) continue;
+    final backup = File('$p.undo');
+    try {
+      await f.rename(backup.path);
+      moved.add(backup);
+    } catch (_) {
+      // Put back what was already moved, then report the failure.
+      for (final b in moved) {
+        try {
+          await b.rename(b.path.replaceAll(RegExp(r'\.undo$'), ''));
+        } catch (_) {}
+      }
+      return null;
+    }
+  }
+  return moved;
+}
+
+/// Moves each `<path>.undo` backup back to its original path. Returns
+/// false if any restore failed; files that did move back stay moved,
+/// the rest are left at their `.undo` path for manual recovery.
+Future<bool> restoreFromUndo(List<File> backups) async {
+  var ok = true;
+  for (final backup in backups) {
+    try {
+      final orig = backup.path.replaceAll(RegExp(r'\.undo$'), '');
+      await backup.rename(orig);
+    } catch (_) {
+      ok = false;
+    }
+  }
+  return ok;
+}
+
 /// Map library like the approved mockup: search, a "bring your own map"
 /// import card, the offline library grouped by recency, and quick filters.
 class LibraryScreen extends StatefulWidget {
@@ -60,22 +102,30 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _refreshSizes();
   }
 
-  void _refreshSizes() {
+  /// File sizes are loaded off the UI thread: `statSync` per map in
+  /// initState blocked the first frame for large libraries.
+  Future<void> _refreshSizes() async {
     final lib = AppScope.of(context).library;
-    _sizes.clear();
+    final sizes = <String, String>{};
     for (final m in lib.maps) {
-      try {
-        final bytes = File(lib.pdfPath(m)).statSync().size;
-        _sizes[m.id] = _fmtSize(bytes);
-      } catch (_) {
-        // File missing (e.g. mid-import): leave the size blank.
-      }
+      sizes[m.id] = _fmtSize(await _sizeOf(File(lib.pdfPath(m))));
     }
     for (final d in lib.dxfImports) {
-      try {
-        final bytes = File(lib.dxfPath(d)).statSync().size;
-        _sizes[d.id] = _fmtSize(bytes);
-      } catch (_) {}
+      sizes[d.id] = _fmtSize(await _sizeOf(File(lib.dxfPath(d))));
+    }
+    if (!mounted) return;
+    setState(() {
+      _sizes
+        ..clear()
+        ..addAll(sizes);
+    });
+  }
+
+  Future<int> _sizeOf(File f) async {
+    try {
+      return await f.exists() ? await f.length() : 0;
+    } catch (_) {
+      return 0;
     }
   }
 
@@ -185,18 +235,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
       _lastDeletedDxf = null;
       _lastDeletedDxfBackups.clear();
-      // Move the DXF + cache aside instead of deleting, for Undo.
-      for (final p in [scope.library.dxfPath(d), scope.library.dxfCachePath(d)]) {
-        try {
-          final f = File(p);
-          if (await f.exists()) {
-            final backup = File('$p.undo');
-            await f.rename(backup.path);
-            _lastDeletedDxfBackups.add(backup);
-          }
-        } catch (_) {}
+      // Move the DXF + cache aside instead of deleting, for Undo. If
+      // any existing file can't be moved aside the delete is aborted
+      // (the helper puts back what it already moved): removing the
+      // entry would destroy the only copy with no way to undo.
+      final moved = await moveAsideForUndo(
+          [scope.library.dxfPath(d), scope.library.dxfCachePath(d)]);
+      if (moved == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content: Text(
+                    'Couldn\'t delete "${d.name}" — please try again')),
+          );
+        }
+        return;
       }
-      if (_lastDeletedDxfBackups.isNotEmpty) _lastDeletedDxf = d;
+      _lastDeletedDxfBackups.addAll(moved);
+      if (moved.isNotEmpty) _lastDeletedDxf = d;
       await scope.library.removeDxf(d);
       _sizes.remove(d.id);
       if (mounted) {
@@ -217,13 +273,22 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final backups = List<File>.from(_lastDeletedDxfBackups);
     _lastDeletedDxf = null;
     _lastDeletedDxfBackups.clear();
-    if (d == null || backups.isEmpty || !mounted) return;
+    if (!mounted) return;
+    if (d == null || backups.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'Couldn\'t restore the drawing — the files are gone')),
+      );
+      return;
+    }
     final scope = AppScope.of(context);
-    for (final backup in backups) {
-      try {
-        final orig = backup.path.replaceAll(RegExp(r'\.undo$'), '');
-        await backup.rename(orig);
-      } catch (_) {}
+    final messenger = ScaffoldMessenger.of(context);
+    if (!await restoreFromUndo(backups)) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Couldn\'t restore "${d.name}"')),
+      );
+      return;
     }
     scope.library.dxfImports.add(d);
     await scope.library.save();
@@ -280,15 +345,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
         } catch (_) {}
       }
       // Move the PDF aside instead of deleting, so Undo can restore it.
-      final pdfPath = scope.library.pdfPath(m);
-      final backup = File('$pdfPath.undo');
-      try {
-        if (await File(pdfPath).exists()) {
-          await File(pdfPath).rename(backup.path);
-          _lastDeletedMap = m;
-          _lastDeletedBackup = backup;
+      // If the file exists but can't be moved aside, abort the delete:
+      // removing the entry would destroy the only copy with no undo.
+      final moved = await moveAsideForUndo([scope.library.pdfPath(m)]);
+      if (moved == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content: Text(
+                    'Couldn\'t delete "${m.name}" — please try again')),
+          );
         }
-      } catch (_) {}
+        return;
+      }
+      if (moved.isNotEmpty) {
+        _lastDeletedMap = m;
+        _lastDeletedBackup = moved.single;
+      }
       await scope.library.remove(m);
       await scope.thumbnailService.deleteThumbnail(m.id);
       _sizes.remove(m.id);
@@ -310,15 +383,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final backup = _lastDeletedBackup;
     _lastDeletedMap = null;
     _lastDeletedBackup = null;
-    if (m == null || backup == null || !mounted) return;
+    if (!mounted) return;
+    if (m == null || backup == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Couldn\'t restore the map — the file is gone')),
+      );
+      return;
+    }
     final scope = AppScope.of(context);
-    try {
-      await backup.rename(scope.library.pdfPath(m));
-    } catch (_) {}
+    final messenger = ScaffoldMessenger.of(context);
+    if (!await restoreFromUndo([backup])) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Couldn\'t restore "${m.name}"')),
+      );
+      return;
+    }
     scope.library.maps.add(m);
     await scope.library.save();
     _refreshSizes();
-    setState(() {});
+    if (mounted) setState(() {});
     // The thumbnail rebuilds on demand via backfill.
   }
 
@@ -450,7 +534,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ),
             )
           else
-            ...maps.map((m) => Padding(
+            // Lazily built: cards (and their thumbnail renders) only
+            // start when scrolled into view.
+            ListView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: maps.length,
+              itemBuilder: (context, i) {
+                final m = maps[i];
+                return Padding(
                   padding: const EdgeInsets.only(bottom: 10),
                   child: _MapCard(
                     map: m,
@@ -461,7 +553,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     onShowInfo: () => showMapInfoSheet(context, m),
                     onAddToOverlay: m.visible ? null : () => _addToOverlay(m),
                   ),
-                )),
+                );
+              },
+            ),
           const SizedBox(height: 16),
           Text(
             'QUICK FILTERS',
@@ -530,19 +624,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 ),
               );
             }
-            return Column(
-              children: [
-                for (final d in dxfs)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: _DxfCard(
-                      drawing: d,
-                      sizeLabel: _sizes[d.id],
-                      onOpen: () => widget.onOpenDxf(d),
-                      onDelete: () => _deleteDxf(d),
-                    ),
+            // Lazily built like the map cards above.
+            return ListView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: dxfs.length,
+              itemBuilder: (context, i) {
+                final d = dxfs[i];
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: _DxfCard(
+                    drawing: d,
+                    sizeLabel: _sizes[d.id],
+                    onOpen: () => widget.onOpenDxf(d),
+                    onDelete: () => _deleteDxf(d),
                   ),
-              ],
+                );
+              },
             );
           }),
         ],

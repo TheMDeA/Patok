@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
@@ -15,40 +17,82 @@ import 'package:uuid/uuid.dart';
 
 import 'dxf/dxf_crs.dart';
 import 'dxf/dxf_import.dart';
+import 'dxf/dxf_model.dart';
 import 'geopdf/georef.dart';
 import 'geopdf/pdf_parser.dart';
 import 'models.dart';
 
 const _uuid = Uuid();
 
-/// Arguments for [_encodePngIsolate]; must be a simple transferable type.
-class _PngEncodeArgs {
-  _PngEncodeArgs(this.width, this.height, this.bgra);
-  final int width;
-  final int height;
-  final Uint8List bgra;
+/// Encodes BGRA8888 pixels as PNG on a background isolate so large
+/// pages don't freeze or OOM the UI thread. The pixel buffer is
+/// transferred (not copied) via [TransferableTypedData], and the
+/// encoder output is returned directly — the old path copied the bitmap
+/// ~3x (pixels -> isolate message -> Image.fromBytes -> fromList).
+Future<Uint8List> _encodePng(int width, int height, Uint8List bgra) {
+  final transferable = TransferableTypedData.fromList([bgra]);
+  return Isolate.run(() {
+    final bytes = transferable.materialize().asUint8List();
+    final decoded = img.Image.fromBytes(
+      width: width,
+      height: height,
+      bytes: bytes.buffer,
+      numChannels: 4,
+      order: img.ChannelOrder.bgra,
+    );
+    return img.encodePng(decoded);
+  });
 }
 
-/// Encodes BGRA8888 pixels as PNG. Runs on a background isolate via
-/// [compute] so large pages don't freeze or OOM the UI thread.
-Uint8List _encodePngIsolate(_PngEncodeArgs args) {
-  final decoded = img.Image.fromBytes(
-    width: args.width,
-    height: args.height,
-    bytes: args.bgra.buffer,
-    numChannels: 4,
-    order: img.ChannelOrder.bgra,
+/// Cached app-directory future: the platform-channel call + directory
+/// stats used to run on every use. Failures are not cached, so a
+/// transient error doesn't poison later calls.
+Future<Directory>? _appDirCache;
+
+Future<Directory> _appDir() {
+  final cached = _appDirCache;
+  if (cached != null) return cached;
+  final created = _createAppDir();
+  _appDirCache = created;
+  created.then(
+    (_) {},
+    onError: (_) {
+      if (identical(_appDirCache, created)) _appDirCache = null;
+    },
   );
-  return Uint8List.fromList(img.encodePng(decoded));
+  return created;
 }
 
-Future<Directory> _appDir() async {
+Future<Directory> _createAppDir() async {
   final docs = await getApplicationDocumentsDirectory();
   final dir = Directory('${docs.path}/patok');
   if (!await dir.exists()) await dir.create(recursive: true);
   final maps = Directory('${dir.path}/maps');
   if (!await maps.exists()) await maps.create();
   return dir;
+}
+
+/// Writes [content] to [file] atomically: write a temp file in the same
+/// directory, flush it, then rename over the target. A crash mid-write
+/// can leave a stale temp file but never a truncated target.
+Future<void> _writeFileAtomic(File file, String content) async {
+  final tmp = File('${file.path}.tmp');
+  await tmp.writeAsString(content, flush: true);
+  await tmp.rename(file.path);
+}
+
+/// Serializes async writes so overlapping saves can't lose updates:
+/// each save runs after the previous one completes, and encodes the
+/// state at execution time (so the last queued write always holds the
+/// latest state). A failing save doesn't break the chain.
+class _SaveQueue {
+  Future<void> _tail = Future.value();
+
+  Future<void> run(Future<void> Function() task) {
+    final run = _tail.then((_) => task());
+    _tail = run.then((_) {}, onError: (_) {});
+    return run;
+  }
 }
 
 /// Persistent library of imported maps (JSON index + copied PDFs)
@@ -70,16 +114,25 @@ class MapLibrary {
       final mapsJson = raw is List ? raw : (raw['maps'] as List? ?? []);
       final dxfJson =
           raw is Map ? (raw['dxfImports'] as List? ?? []) : const [];
-      final maps = mapsJson
-          .map((j) => GeoMap.fromJson(j as Map<String, dynamic>))
-          .toList();
+      // Per-entry tolerance: one corrupt entry is skipped, the rest
+      // survive. The old all-or-nothing parse returned an empty library
+      // for a single bad entry, and the next save made that permanent.
+      final maps = <GeoMap>[];
+      for (final j in mapsJson) {
+        try {
+          maps.add(GeoMap.fromJson(j as Map<String, dynamic>));
+        } catch (_) {}
+      }
       // Drop entries whose PDF is missing.
       maps.removeWhere(
         (m) => !File('${dir.path}/${m.relativePdfPath}').existsSync(),
       );
-      final dxfs = dxfJson
-          .map((j) => DxfImport.fromJson(j as Map<String, dynamic>))
-          .toList();
+      final dxfs = <DxfImport>[];
+      for (final j in dxfJson) {
+        try {
+          dxfs.add(DxfImport.fromJson(j as Map<String, dynamic>));
+        } catch (_) {}
+      }
       // Drop entries whose geometry cache is missing.
       dxfs.removeWhere(
         (d) => !File('${dir.path}/${d.relativeCachePath}').existsSync(),
@@ -98,40 +151,74 @@ class MapLibrary {
   Future<DxfLocalGridStore> dxfLocalGrids() =>
       DxfLocalGridStore.load(_dir);
 
-  Future<void> save() async {
+  final _saveQueue = _SaveQueue();
+
+  Future<void> save() => _saveQueue.run(_writeSave);
+
+  Future<void> _writeSave() async {
     final file = File('${_dir.path}/library.json');
-    await file.writeAsString(jsonEncode({
-      'maps': maps.map((m) => m.toJson()).toList(),
-      'dxfImports': dxfImports.map((d) => d.toJson()).toList(),
-    }));
+    await _writeFileAtomic(
+      file,
+      jsonEncode({
+        'maps': maps.map((m) => m.toJson()).toList(),
+        'dxfImports': dxfImports.map((d) => d.toJson()).toList(),
+      }),
+    );
   }
 
   Future<void> add(GeoMap map) async {
     maps.add(map);
-    await save();
+    try {
+      await save();
+    } catch (_) {
+      maps.remove(map);
+      rethrow;
+    }
   }
 
+  /// Removes the entry and deletes its PDF — but only after the library
+  /// file has been saved without it. Deleting first would lose the only
+  /// copy if the save then failed (e.g. a failed delete-undo rename).
   Future<void> remove(GeoMap map) async {
-    maps.removeWhere((m) => m.id == map.id);
+    final index = maps.indexWhere((m) => m.id == map.id);
+    if (index < 0) return;
+    final removed = maps.removeAt(index);
+    try {
+      await save();
+    } catch (_) {
+      maps.insert(index, removed);
+      rethrow;
+    }
     final pdf = File(pdfPath(map));
     if (await pdf.exists()) await pdf.delete();
-    await save();
   }
 
   Future<void> addDxf(DxfImport d) async {
     dxfImports.add(d);
-    await save();
+    try {
+      await save();
+    } catch (_) {
+      dxfImports.remove(d);
+      rethrow;
+    }
   }
 
   Future<void> removeDxf(DxfImport d) async {
-    dxfImports.removeWhere((x) => x.id == d.id);
+    final index = dxfImports.indexWhere((x) => x.id == d.id);
+    if (index < 0) return;
+    final removed = dxfImports.removeAt(index);
+    try {
+      await save();
+    } catch (_) {
+      dxfImports.insert(index, removed);
+      rethrow;
+    }
     for (final p in [dxfPath(d), dxfCachePath(d)]) {
       try {
         final f = File(p);
         if (await f.exists()) await f.delete();
       } catch (_) {}
     }
-    await save();
   }
 }
 
@@ -262,10 +349,7 @@ class RenderService {
       try {
         // BGRA -> PNG on a background isolate: the pure-Dart encoder
         // blocks the UI thread for seconds on large images (ANR).
-        final png = await compute(
-          _encodePngIsolate,
-          _PngEncodeArgs(image.width, image.height, image.pixels),
-        );
+        final png = await _encodePng(image.width, image.height, image.pixels);
         final corners = _corners(
           georef: georef,
           imgW: image.width.toDouble(),
@@ -420,10 +504,7 @@ class RenderService {
         throw StateError('Failed to render region of page ${georef.pageIndex}');
       }
       try {
-        final png = await compute(
-          _encodePngIsolate,
-          _PngEncodeArgs(image.width, image.height, image.pixels),
-        );
+        final png = await _encodePng(image.width, image.height, image.pixels);
         final corners = _cornersForRect(
           georef: georef,
           x: x.toDouble(),
@@ -550,57 +631,75 @@ class ImportService {
     final fileName = sourcePath.split(Platform.pathSeparator).last;
     final dest = File('${dir.path}/maps/$id.pdf');
 
-    onProgress('Copying file…');
-    await File(sourcePath).copy(dest.path);
-
+    // Parse the picked file first: a PDF with no georeferencing (or a
+    // corrupt file) fails before any copy is made, so failed imports
+    // leave no orphan behind — and the file is only read once.
     onProgress('Reading PDF structure…');
-    final bytes = await dest.readAsBytes();
+    final bytes = await File(sourcePath).readAsBytes();
     final parser = PdfParser.parse(bytes);
 
     onProgress('Extracting georeferencing…');
-    final georefs = GeorefExtractor(parser).extractAll();
+    final extractor = GeorefExtractor(parser);
+    final georefs = extractor.extractAll();
     if (georefs.isEmpty) {
-      await dest.delete();
       throw StateError(
         'No georeferencing found in this PDF. Patok reads OGC '
         'georegistration (/VP /Measure) and TerraGo (/LGIDict) maps.',
       );
     }
 
-    onProgress('Computing map extents…');
-    final pages = <GeoMapPage>[];
-    for (var i = 0; i < georefs.length; i++) {
-      final g = georefs[i];
-      // Render a tiny thumbnail-free corner computation: reuse the
-      // corner math with a 72dpi-equivalent pixel grid.
-      final corners = _render._corners(
-        georef: g,
-        imgW: g.pageWidthPt,
-        imgH: g.pageHeightPt,
-      );
-      pages.add(
-        GeoMapPage(
-          pageIndex: g.pageIndex,
-          name: georefs.length == 1 ? 'Map' : 'Page ${g.pageIndex + 1}',
+    onProgress('Copying file…');
+    // The maps dir is normally created by _appDir(), but the app-dir
+    // future is cached, so re-create it here if it ever went missing.
+    await dest.parent.create(recursive: true);
+    await File(sourcePath).copy(dest.path);
+    GeoMap map;
+    try {
+      onProgress('Computing map extents…');
+      final pages = <GeoMapPage>[];
+      for (var i = 0; i < georefs.length; i++) {
+        final g = georefs[i];
+        // Render a tiny thumbnail-free corner computation: reuse the
+        // corner math with a 72dpi-equivalent pixel grid.
+        final corners = _render._corners(
           georef: g,
-          cornerLonLat: corners.map((p) => [p.x, p.y]).toList(),
-        ),
-      );
-    }
+          imgW: g.pageWidthPt,
+          imgH: g.pageHeightPt,
+        );
+        pages.add(
+          GeoMapPage(
+            pageIndex: g.pageIndex,
+            name: georefs.length == 1 ? 'Map' : 'Page ${g.pageIndex + 1}',
+            georef: g,
+            cornerLonLat: corners.map((p) => [p.x, p.y]).toList(),
+          ),
+        );
+      }
 
-    final map = GeoMap(
-      id: id,
-      name: fileName.replaceAll(RegExp(r'\.pdf$', caseSensitive: false), ''),
-      fileName: fileName,
-      pages: pages,
-    );
-    onProgress('Saving to library…');
-    await _library.add(map);
+      map = GeoMap(
+        id: id,
+        name: fileName.replaceAll(RegExp(r'\.pdf$', caseSensitive: false), ''),
+        fileName: fileName,
+        pages: pages,
+        // Pages whose georeferencing was broken are skipped, not fatal —
+        // carry the reasons on the result so the import screen can tell
+        // the user instead of silently dropping them.
+        skippedPages: List<String>.of(extractor.pageErrors),
+      );
+      onProgress('Saving to library…');
+      await _library.add(map);
+    } catch (_) {
+      // The import failed after the copy: remove the orphaned file.
+      try {
+        if (await dest.exists()) await dest.delete();
+      } catch (_) {}
+      rethrow;
+    }
     // Best-effort library thumbnail; a failure here never fails the import.
     try {
       final png = await _render.renderThumbnail(
         pdfPath: dest.path,
-        georef: pages.first.georef,
+        georef: map.pages.first.georef,
       );
       final thumb = File('${dir.path}/thumbs/$id.png');
       await thumb.parent.create(recursive: true);
@@ -623,7 +722,9 @@ class ImportService {
     final path = files.single.path;
     if (path == null) throw StateError('Picked file has no path');
     onProgress('Parsing DXF…');
-    final parsed = parseDxfFile(path);
+    // Parsing runs on a background isolate: a multi-MB DXF used to
+    // freeze the UI for seconds, and the progress UI never painted.
+    final parsed = await compute(parseDxfFile, path);
     if (parsed.doc.entities.isEmpty) {
       throw StateError(
         'No supported entities found in this DXF. Patok reads LINE, '
@@ -647,36 +748,78 @@ class ImportService {
     onProgress('Copying file…');
     final dxfDir = Directory('${dir.path}/dxf');
     if (!await dxfDir.exists()) await dxfDir.create(recursive: true);
-    await File(parsed.sourcePath).copy('${dxfDir.path}/$id.dxf');
+    final dxfFile = File('${dxfDir.path}/$id.dxf');
+    final cacheFile = File('${dxfDir.path}/$id.json');
+    await File(parsed.sourcePath).copy(dxfFile.path);
 
-    onProgress('Projecting geometry…');
-    final bounds = <double>[];
-    final features = buildDxfFeatures(
-      parsed.doc,
-      crs,
-      bounds,
-      onProgress: (done, total) =>
-          onProgress('Projecting geometry… ${(done / total * 100).round()}%'),
-    );
-    if (features.isEmpty) {
-      throw StateError('Nothing renderable survived the projection.');
+    try {
+      // Projection runs on a background isolate so the progress UI
+      // paints and the app stays responsive on large drawings. The
+      // per-500-entity progress callback can't cross isolates, so the
+      // sheet shows an indeterminate "Projecting geometry…" instead.
+      onProgress('Projecting geometry…');
+      final projected = await compute(
+        _projectDxfFeatures,
+        _DxfProjectArgs(doc: parsed.doc, crsJson: crs.toJson()),
+      );
+      final features = projected.features;
+      final bounds = projected.bounds;
+      if (features.isEmpty) {
+        throw StateError('Nothing renderable survived the projection.');
+      }
+
+      onProgress('Writing cache…');
+      await writeDxfCache(dir, id, features);
+
+      final imp = DxfImport(
+        id: id,
+        name: name,
+        fileName: parsed.fileName,
+        crs: crs,
+        bounds: bounds,
+        cadLayers: {for (final k in features.keys) k: true},
+      );
+      onProgress('Saving to library…');
+      await _library.addDxf(imp);
+      return imp;
+    } catch (_) {
+      // Projection, cache write or library save failed: remove the
+      // copied source (and any partial cache) so a failed import leaves
+      // no orphan files behind.
+      for (final f in [dxfFile, cacheFile]) {
+        try {
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
+      rethrow;
     }
-
-    onProgress('Writing cache…');
-    await writeDxfCache(dir, id, features);
-
-    final imp = DxfImport(
-      id: id,
-      name: name,
-      fileName: parsed.fileName,
-      crs: crs,
-      bounds: bounds,
-      cadLayers: {for (final k in features.keys) k: true},
-    );
-    onProgress('Saving to library…');
-    await _library.addDxf(imp);
-    return imp;
   }
+}
+
+/// Arguments for [_projectDxfFeatures]: plain data only, so they can
+/// cross to a background isolate. The CRS travels as JSON — its proj4
+/// [Projection] object is not isolate-sendable — and is rebuilt inside
+/// the isolate.
+class _DxfProjectArgs {
+  _DxfProjectArgs({required this.doc, required this.crsJson});
+  final DxfDocument doc;
+  final Map<String, dynamic> crsJson;
+}
+
+class _ProjectedDxf {
+  _ProjectedDxf(this.features, this.bounds);
+  final Map<String, List<Map<String, dynamic>>> features;
+  final List<double> bounds;
+}
+
+_ProjectedDxf _projectDxfFeatures(_DxfProjectArgs args) {
+  final bounds = <double>[];
+  final features = buildDxfFeatures(
+    args.doc,
+    DxfCrs.fromJson(args.crsJson),
+    bounds,
+  );
+  return _ProjectedDxf(features, bounds);
 }
 
 /// Small page previews for library cards, cached on disk under
@@ -726,19 +869,28 @@ class ThumbnailService {
 /// GPS location via geolocator (works fully offline; network only
 /// speeds up the first fix).
 class LocationService {
-  Stream<Position>? _stream;
-  Stream<Position>? _rawStream;
+  /// Called when location permission becomes granted (first grant or
+  /// already granted). Wired in main.dart to restart the GNSS stream,
+  /// which cannot start before permission exists.
+  void Function()? onPermissionGranted;
 
   Future<bool> ensurePermission() async {
     var perm = await Geolocator.checkPermission();
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
     }
-    return perm == LocationPermission.always ||
+    final granted = perm == LocationPermission.always ||
         perm == LocationPermission.whileInUse;
+    if (granted) onPermissionGranted?.call();
+    return granted;
   }
 
-  Future<Position?> currentPosition() async {
+  /// A last-known fix older than [maxLastKnownAge] is worse than none:
+  /// grid reference points and waypoints would silently use a fix from
+  /// hours or days ago.
+  Future<Position?> currentPosition({
+    Duration maxLastKnownAge = const Duration(seconds: 60),
+  }) async {
     if (!await ensurePermission()) return null;
     try {
       return await Geolocator.getCurrentPosition(
@@ -747,30 +899,113 @@ class LocationService {
         ),
       ).timeout(const Duration(seconds: 15));
     } catch (_) {
-      return await Geolocator.getLastKnownPosition();
+      final last = await Geolocator.getLastKnownPosition();
+      if (last == null) return null;
+      if (DateTime.now().difference(last.timestamp) > maxLastKnownAge) {
+        return null;
+      }
+      return last;
     }
   }
 
+  // The platform streams run only while someone is listening (or while
+  // explicitly started): the old cached streams ran at best accuracy
+  // for the whole app lifetime, even on other tabs. Listeners get a
+  // shared broadcast stream; [stopPositionUpdates]/[stopRawPositionUpdates]
+  // pause the native updates while listeners stay attached (e.g. the
+  // map tab is hidden), and the matching start methods resume them.
+  StreamController<Position>? _positionController;
+  StreamSubscription<Position>? _positionSub;
+  bool _positionStopped = false;
+
+  StreamController<Position>? _rawController;
+  StreamSubscription<Position>? _rawSub;
+  bool _rawStopped = false;
+
   Stream<Position> positionStream() {
-    _stream ??= Geolocator.getPositionStream(
+    _positionController ??= StreamController<Position>.broadcast(
+      onListen: () {
+        if (!_positionStopped) _startPositionUpdates();
+      },
+      onCancel: _stopPositionUpdates,
+    );
+    return _positionController!.stream;
+  }
+
+  void _startPositionUpdates() {
+    if (_positionSub != null) return;
+    _positionSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.best,
         distanceFilter: 2,
       ),
+    ).listen(
+      (p) => _positionController?.add(p),
+      onError: (_) {},
     );
-    return _stream!;
+  }
+
+  void _stopPositionUpdates() {
+    _positionSub?.cancel();
+    _positionSub = null;
+  }
+
+  /// Stops GPS updates even while listeners are attached.
+  /// Call [startPositionUpdates] to resume.
+  void stopPositionUpdates() {
+    _positionStopped = true;
+    _stopPositionUpdates();
+  }
+
+  void startPositionUpdates() {
+    _positionStopped = false;
+    if (_positionController?.hasListener ?? false) {
+      _startPositionUpdates();
+    }
   }
 
   /// Time-based stream (no distance filter) for stationary work like
   /// waypoint averaging — the main stream goes quiet when not moving.
   Stream<Position> rawPositionStream() {
-    _rawStream ??= Geolocator.getPositionStream(
+    _rawController ??= StreamController<Position>.broadcast(
+      onListen: () {
+        if (!_rawStopped) _startRawPositionUpdates();
+      },
+      onCancel: _stopRawPositionUpdates,
+    );
+    return _rawController!.stream;
+  }
+
+  void _startRawPositionUpdates() {
+    if (_rawSub != null) return;
+    _rawSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.best,
         distanceFilter: 0,
       ),
+    ).listen(
+      (p) => _rawController?.add(p),
+      onError: (_) {},
     );
-    return _rawStream!;
+  }
+
+  void _stopRawPositionUpdates() {
+    _rawSub?.cancel();
+    _rawSub = null;
+  }
+
+  /// Stops the time-based stream even while listeners are attached.
+  /// Call [startRawPositionUpdates] to resume.
+  void stopRawPositionUpdates() {
+    _rawStopped = true;
+    _stopRawPositionUpdates();
+  }
+
+  void startRawPositionUpdates() {
+    _rawStopped = false;
+    if (_rawController?.hasListener ?? false) {
+      _startRawPositionUpdates();
+    }
   }
 }
 
@@ -793,10 +1028,24 @@ class TrackRecorder {
       : DateTime.now().difference(startTime!);
 
   /// Live (lon, lat) points while recording; empty when idle.
+  /// Fixes append to the persistent point list and the notifier is
+  /// given a fresh unmodifiable *view* of it: a view is O(1) to
+  /// create (no element copy), unlike the old full copy per fix.
   final ValueNotifier<List<List<double>>> livePoints = ValueNotifier(const []);
 
   StreamSubscription<Position>? _sub;
   final List<List<double>> _points = [];
+
+  static const _trackChannel = MethodChannel('patok/track');
+
+  /// Keeps the foreground service in sync with the recording state, so
+  /// fixes keep flowing while the phone is locked. A missing native
+  /// handler (unit tests) is ignored: recording still works without it.
+  Future<void> _setForegroundTracking(bool active) async {
+    try {
+      await _trackChannel.invokeMethod(active ? 'start' : 'stop');
+    } catch (_) {}
+  }
 
   Future<void> start() async {
     if (isRecording.value) return;
@@ -805,14 +1054,30 @@ class TrackRecorder {
     }
     _points.clear();
     pointCount.value = 0;
-    livePoints.value = const [];
-    _sub = _locationService.positionStream().listen((p) {
-      _points.add([p.longitude, p.latitude]);
-      pointCount.value = _points.length;
-      livePoints.value = List.unmodifiable(_points);
-    });
+    livePoints.value = UnmodifiableListView<List<double>>(_points);
+    // The stream may be paused because the map tab is hidden; recording
+    // needs live fixes wherever it is started from, so resume first.
+    _locationService.startPositionUpdates();
+    _sub = _locationService.positionStream().listen(
+      (p) {
+        _points.add([p.longitude, p.latitude]);
+        pointCount.value = _points.length;
+        livePoints.value = UnmodifiableListView<List<double>>(_points);
+      },
+      onError: (_) {
+        // The platform stream died (e.g. permission revoked): stop
+        // collecting so the recording state doesn't lie, but keep the
+        // points so stop() can still save the partial track.
+        _sub?.cancel();
+        _sub = null;
+        isRecording.value = false;
+        startTime = null;
+        _setForegroundTracking(false);
+      },
+    );
     startTime = DateTime.now();
     isRecording.value = true;
+    _setForegroundTracking(true);
   }
 
   /// Stops recording and returns the track as a [Measurement], or null
@@ -822,6 +1087,7 @@ class TrackRecorder {
     _sub = null;
     isRecording.value = false;
     startTime = null;
+    _setForegroundTracking(false);
     final points = List<List<double>>.of(_points);
     _points.clear();
     pointCount.value = 0;
@@ -849,6 +1115,7 @@ class TrackRecorder {
     _sub = null;
     isRecording.value = false;
     startTime = null;
+    _setForegroundTracking(false);
     _points.clear();
     pointCount.value = 0;
     livePoints.value = const [];
@@ -875,9 +1142,15 @@ class SettingsService {
     _sunlightMode.value = v;
   }
 
-  /// Render DPI for map overlays (96 / 150 / 300).
-  double get renderDpi => _prefs.getDouble('renderDpi') ?? 150;
-  Future<void> setRenderDpi(double v) => _prefs.setDouble('renderDpi', v);
+  /// Render DPI for map overlays (96 / 150 / 300). Out-of-range values
+  /// (e.g. from a corrupt prefs file) are clamped, never trusted.
+  double get renderDpi {
+    final v = _prefs.getDouble('renderDpi') ?? 150;
+    return v.clamp(96, 300).toDouble();
+  }
+
+  Future<void> setRenderDpi(double v) =>
+      _prefs.setDouble('renderDpi', v.clamp(96, 300).toDouble());
 
   /// 'utm' or 'latlon'.
   String get coordFormat => _prefs.getString('coordFormat') ?? 'utm';
@@ -892,10 +1165,15 @@ class SettingsService {
   Future<void> setDetailZoom(bool v) => _prefs.setBool('detailZoom', v);
 
   /// Last DXF import UTM zone/hemisphere (remembered for next import).
-  int get lastDxfUtmZone => _prefs.getInt('lastDxfUtmZone') ?? 50;
+  /// Zones are 1..60; out-of-range values are clamped, never trusted.
+  int get lastDxfUtmZone {
+    final z = _prefs.getInt('lastDxfUtmZone') ?? 50;
+    return z.clamp(1, 60);
+  }
+
   bool get lastDxfUtmSouth => _prefs.getBool('lastDxfUtmSouth') ?? true;
   Future<void> setLastDxfUtm(int zone, bool south) async {
-    await _prefs.setInt('lastDxfUtmZone', zone);
+    await _prefs.setInt('lastDxfUtmZone', zone.clamp(1, 60));
     await _prefs.setBool('lastDxfUtmSouth', south);
   }
 }
@@ -916,12 +1194,31 @@ class GnssService {
         satellites.value =
             ((m['used'] as num).toInt(), (m['total'] as num).toInt());
       } catch (_) {}
-    }, onError: (_) {});
+    }, onError: (_) {
+      // The native side errors when location permission is missing
+      // (SecurityException). The stream is dead after an error, so
+      // clear the subscription: a later ensureStarted() can retry
+      // instead of the count staying blank for the whole session.
+      _sub = null;
+    });
+  }
+
+  /// Starts the stream if it isn't running. The first start() happens
+  /// in main() before any permission exists and dies silently; this is
+  /// the retry path, called once permission is granted.
+  void ensureStarted() => start();
+
+  /// Restarts the stream (stop + start).
+  void restart() {
+    stop();
+    start();
   }
 
   void stop() {
     _sub?.cancel();
     _sub = null;
+    // Don't keep a stale satellite count after stopping.
+    satellites.value = null;
   }
 }
 
@@ -930,6 +1227,8 @@ class FieldDataStore {
   FieldDataStore._(this._dir);
   final Directory _dir;
 
+  final _SaveQueue _saveQueue = _SaveQueue();
+
   static Future<FieldDataStore> load() async =>
       FieldDataStore._(await _appDir());
 
@@ -937,33 +1236,58 @@ class FieldDataStore {
     final f = File('${_dir.path}/waypoints.json');
     if (!await f.exists()) return [];
     try {
-      return (jsonDecode(await f.readAsString()) as List)
-          .map((j) => Waypoint.fromJson(j as Map<String, dynamic>))
-          .toList();
+      final list = jsonDecode(await f.readAsString()) as List;
+      // Per-entry tolerance: one corrupt waypoint must not wipe the rest.
+      final out = <Waypoint>[];
+      for (final j in list) {
+        try {
+          out.add(Waypoint.fromJson(j as Map<String, dynamic>));
+        } catch (_) {}
+      }
+      return out;
     } catch (_) {
       return [];
     }
   }
 
-  Future<void> saveWaypoints(List<Waypoint> wps) async {
-    final f = File('${_dir.path}/waypoints.json');
-    await f.writeAsString(jsonEncode(wps.map((w) => w.toJson()).toList()));
+  Future<void> saveWaypoints(List<Waypoint> wps) {
+    // Snapshot: the caller may keep mutating its list while the write
+    // is queued behind another save.
+    final snapshot = List<Waypoint>.of(wps);
+    return _saveQueue.run(() async {
+      final f = File('${_dir.path}/waypoints.json');
+      await _writeFileAtomic(
+        f,
+        jsonEncode(snapshot.map((w) => w.toJson()).toList()),
+      );
+    });
   }
 
   Future<List<Measurement>> measurements() async {
     final f = File('${_dir.path}/measurements.json');
     if (!await f.exists()) return [];
     try {
-      return (jsonDecode(await f.readAsString()) as List)
-          .map((j) => Measurement.fromJson(j as Map<String, dynamic>))
-          .toList();
+      final list = jsonDecode(await f.readAsString()) as List;
+      final out = <Measurement>[];
+      for (final j in list) {
+        try {
+          out.add(Measurement.fromJson(j as Map<String, dynamic>));
+        } catch (_) {}
+      }
+      return out;
     } catch (_) {
       return [];
     }
   }
 
-  Future<void> saveMeasurements(List<Measurement> ms) async {
-    final f = File('${_dir.path}/measurements.json');
-    await f.writeAsString(jsonEncode(ms.map((m) => m.toJson()).toList()));
+  Future<void> saveMeasurements(List<Measurement> ms) {
+    final snapshot = List<Measurement>.of(ms);
+    return _saveQueue.run(() async {
+      final f = File('${_dir.path}/measurements.json');
+      await _writeFileAtomic(
+        f,
+        jsonEncode(snapshot.map((m) => m.toJson()).toList()),
+      );
+    });
   }
 }

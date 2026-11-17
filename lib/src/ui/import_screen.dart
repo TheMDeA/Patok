@@ -156,6 +156,15 @@ class _ResultView extends StatelessWidget {
                     '${map.pages.length} georeferenced page(s) found',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
+                  if (map.skippedPages.isNotEmpty)
+                    Text(
+                      '${map.skippedPages.length} page(s) skipped: '
+                      '${map.skippedPages.join(', ')}',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(color: Colors.amber),
+                    ),
                 ],
               ),
             ),

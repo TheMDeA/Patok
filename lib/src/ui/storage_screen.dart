@@ -2,12 +2,14 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../dxf/dxf_import.dart';
 import '../models.dart';
 import '../theme.dart';
 import 'app_scope.dart';
 
-/// Storage manager: per-map disk usage (PDF + cached thumbnail) with a
-/// one-tap clear of regenerable previews.
+/// Storage manager: per-map disk usage (PDF + cached thumbnail) and
+/// per-drawing usage (DXF + geometry cache) with a one-tap clear of
+/// regenerable previews.
 class StorageScreen extends StatefulWidget {
   const StorageScreen({super.key});
 
@@ -23,8 +25,17 @@ class _MapUsage {
   int get total => pdfBytes + thumbBytes;
 }
 
+class _DxfUsage {
+  _DxfUsage(this.drawing, this.dxfBytes, this.cacheBytes);
+  final DxfImport drawing;
+  final int dxfBytes;
+  final int cacheBytes;
+  int get total => dxfBytes + cacheBytes;
+}
+
 class _StorageScreenState extends State<StorageScreen> {
   List<_MapUsage> _usage = [];
+  List<_DxfUsage> _dxfUsage = [];
   bool _loading = true;
   bool _clearing = false;
 
@@ -53,9 +64,18 @@ class _StorageScreenState extends State<StorageScreen> {
       usage.add(_MapUsage(m, pdfBytes, thumbBytes));
     }
     usage.sort((a, b) => b.total.compareTo(a.total));
+    final dxfUsage = <_DxfUsage>[];
+    for (final d in scope.library.dxfImports) {
+      final dxfBytes = await _sizeOf(File(scope.library.dxfPath(d)));
+      final cacheBytes =
+          await _sizeOf(File(scope.library.dxfCachePath(d)));
+      dxfUsage.add(_DxfUsage(d, dxfBytes, cacheBytes));
+    }
+    dxfUsage.sort((a, b) => b.total.compareTo(a.total));
     if (mounted) {
       setState(() {
         _usage = usage;
+        _dxfUsage = dxfUsage;
         _loading = false;
       });
     }
@@ -89,7 +109,9 @@ class _StorageScreenState extends State<StorageScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final total = _usage.fold<int>(0, (s, u) => s + u.total);
+    final mapsTotal = _usage.fold<int>(0, (s, u) => s + u.total);
+    final dxfTotal = _dxfUsage.fold<int>(0, (s, u) => s + u.total);
+    final total = mapsTotal + dxfTotal;
     final thumbs = _usage.fold<int>(0, (s, u) => s + u.thumbBytes);
     return Scaffold(
       appBar: AppBar(title: const Text('Storage')),
@@ -104,7 +126,7 @@ class _StorageScreenState extends State<StorageScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('Total map storage',
+                        Text('Total storage',
                             style: Theme.of(context).textTheme.titleMedium),
                         const SizedBox(height: 4),
                         Text(
@@ -113,6 +135,11 @@ class _StorageScreenState extends State<StorageScreen> {
                               .textTheme
                               .headlineSmall
                               ?.copyWith(color: PatokTheme.accent),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Maps ${_fmt(mapsTotal)} · DXF drawings ${_fmt(dxfTotal)}',
+                          style: Theme.of(context).textTheme.bodySmall,
                         ),
                         const SizedBox(height: 12),
                         SizedBox(
@@ -160,12 +187,40 @@ class _StorageScreenState extends State<StorageScreen> {
                       ),
                     ),
                   ),
-                if (_usage.isEmpty)
+                if (_usage.isEmpty && _dxfUsage.isEmpty)
                   const Padding(
                     padding: EdgeInsets.all(24),
                     child: Center(
-                        child: Text('No maps yet — nothing stored.')),
+                        child: Text(
+                            'No maps or drawings yet — nothing stored.')),
                   ),
+                if (_dxfUsage.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'DXF DRAWINGS',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          letterSpacing: 1.2,
+                          fontWeight: FontWeight.w800,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  for (final u in _dxfUsage)
+                    Card(
+                      child: ListTile(
+                        leading: const Icon(Icons.polyline,
+                            color: PatokTheme.accent),
+                        title: Text(u.drawing.name,
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: Text(
+                            'Drawing file ${_fmt(u.dxfBytes)} · Geometry cache ${_fmt(u.cacheBytes)}'),
+                        trailing: Text(
+                          _fmt(u.total),
+                          style:
+                              const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ),
+                ],
               ],
             ),
     );

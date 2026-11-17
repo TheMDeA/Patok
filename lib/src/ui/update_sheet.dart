@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -30,6 +32,7 @@ class _UpdateSheetState extends State<_UpdateSheet> {
   double _speedBps = 0;
   String? _currentVersion;
   bool _cached = false;
+  bool _cancelled = false;
 
   @override
   void initState() {
@@ -46,6 +49,7 @@ class _UpdateSheetState extends State<_UpdateSheet> {
 
   Future<void> _download() async {
     HapticFeedback.mediumImpact();
+    _cancelled = false;
     try {
       final cached = await isApkCached(widget.info.version);
       if (cached) {
@@ -59,6 +63,7 @@ class _UpdateSheetState extends State<_UpdateSheet> {
       await downloadAndInstall(
         widget.info.apkUrl,
         version: widget.info.version,
+        isCancelled: () => _cancelled,
         onProgress: (p) {
           if (!mounted) return;
           setState(() {
@@ -75,13 +80,25 @@ class _UpdateSheetState extends State<_UpdateSheet> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _phase = _Phase.idle);
+      // Not every failure is a failure: a cancelled download, a
+      // dismissed installer, and the unknown-sources trip to Settings
+      // are all user choices, not errors.
+      final message = switch (e) {
+        DownloadCancelled() => 'Download cancelled.',
+        PlatformException(code: 'INSTALL_CANCELLED') =>
+          'Install cancelled.',
+        PlatformException(code: 'UNKNOWN_SOURCES') =>
+          "Turn on 'Allow from this source' for Patok in Settings, then try again.",
+        _ => 'Update failed: ${_friendlyError(e)}',
+      };
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Update failed: ${_friendlyError(e)}')),
+        SnackBar(content: Text(message)),
       );
     }
   }
 
   String _friendlyError(Object e) {
+    if (e is TimeoutException) return 'Connection stalled — try again';
     final msg = e.toString();
     return msg.replaceFirst(RegExp(r'^(Exception|StateError):\s*'), '');
   }
@@ -214,6 +231,17 @@ class _UpdateSheetState extends State<_UpdateSheet> {
                     ),
                   ),
                 ),
+                if (downloading)
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton(
+                      onPressed: _cancelled
+                          ? null
+                          : () => setState(() => _cancelled = true),
+                      child: Text(
+                          _cancelled ? 'Cancelling…' : 'Cancel download'),
+                    ),
+                  ),
                 SizedBox(
                     height:
                         MediaQuery.of(context).padding.bottom),

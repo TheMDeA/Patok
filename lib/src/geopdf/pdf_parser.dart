@@ -97,7 +97,16 @@ class PdfParser {
 
   factory PdfParser.parse(Uint8List bytes) {
     final p = PdfParser._(bytes);
-    p._parseXrefChain();
+    try {
+      p._parseXrefChain();
+    } on PdfParseException {
+      rethrow;
+    } catch (e) {
+      // Malformed input used to leak raw RangeError/TypeError/
+      // FormatException out of the parser; convert them so callers only
+      // ever see PdfParseException.
+      throw PdfParseException('Failed to parse PDF structure: $e');
+    }
     return p;
   }
 
@@ -180,8 +189,10 @@ class PdfParser {
           throw PdfParseException('Trailer is not a dictionary');
         }
         _trailerDict ??= dict;
-        final prev = dict.number('Prev');
-        return prev?.toInt();
+        // /Prev is usually a direct integer, but resolve it like any
+        // other value so an indirect reference still works.
+        final prevObj = deref(dict['Prev']);
+        return prevObj is PdfNumber ? prevObj.asInt : null;
       }
       // subsection: firstObj count
       final firstObj = _parseAsciiInt(c);
@@ -234,15 +245,19 @@ class PdfParser {
 
   void _parseXrefStream(int objNum, int gen, PdfStream stream) {
     final dict = stream.dict;
-    final w = dict.array('W');
-    if (w == null || w.items.length != 3) {
+    final wObj = deref(dict['W']);
+    if (wObj is! PdfArray || wObj.items.length != 3) {
       throw PdfParseException('XRef stream without /W');
     }
-    final w1 = (w.items[0] as PdfNumber).asInt;
-    final w2 = (w.items[1] as PdfNumber).asInt;
-    final w3 = (w.items[2] as PdfNumber).asInt;
-    final size = dict.number('Size')?.toInt() ?? 0;
-    final indexArr = dict.array('Index');
+    // Via .numbers so string-encoded entries are accepted too.
+    final wNums = wObj.numbers;
+    final w1 = wNums[0].toInt();
+    final w2 = wNums[1].toInt();
+    final w3 = wNums[2].toInt();
+    final sizeObj = deref(dict['Size']);
+    final size = sizeObj is PdfNumber ? sizeObj.asInt : 0;
+    final indexObj = deref(dict['Index']);
+    final indexArr = indexObj is PdfArray ? indexObj : null;
     final raw = _decodeStreamData(stream);
 
     var p = 0;
@@ -280,9 +295,9 @@ class PdfParser {
     }
 
     _trailerDict ??= dict;
-    final prev = dict.number('Prev');
-    if (prev != null) {
-      _parseXrefAt(prev.toInt(), false);
+    final prevObj = deref(dict['Prev']);
+    if (prevObj is PdfNumber) {
+      _parseXrefAt(prevObj.asInt, false);
     }
   }
 
@@ -292,21 +307,22 @@ class PdfParser {
   /// with PNG/TIFF predictors).
   Uint8List _decodeStreamData(PdfStream stream) {
     var data = stream.data;
-    final filter = stream.dict['Filter'];
+    final filter = deref(stream.dict['Filter']);
     final filters = <String>[];
     if (filter is PdfName) {
       filters.add(filter.name);
     } else if (filter is PdfArray) {
       for (final f in filter.items) {
-        if (f is PdfName) filters.add(f.name);
+        final rf = deref(f);
+        if (rf is PdfName) filters.add(rf.name);
       }
     }
-    final decodeParms = stream.dict['DecodeParms'];
+    final decodeParms = deref(stream.dict['DecodeParms']);
     PdfDict? parms;
     if (decodeParms is PdfDict) {
       parms = decodeParms;
     } else if (decodeParms is PdfArray && decodeParms.items.isNotEmpty) {
-      final first = decodeParms.items.first;
+      final first = deref(decodeParms.items.first);
       if (first is PdfDict) parms = first;
     }
     for (final f in filters) {
@@ -345,13 +361,16 @@ class PdfParser {
       return out;
     }
     // PNG predictors 10-15: each row prefixed by filter type byte.
-    final out = <int>[];
+    // Every complete row consumes exactly rowLen + 1 bytes, so the row
+    // count — and the output size — is known up front: preallocate
+    // instead of growing a List<int> row by row.
+    final rowCount = data.length ~/ (rowLen + 1);
+    final out = Uint8List(rowCount * rowLen);
     var p = 0;
     var prevRow = List<int>.filled(rowLen, 0);
-    while (p < data.length) {
-      if (p + 1 + rowLen > data.length) break;
+    for (var r = 0; r < rowCount; r++) {
       final filterType = data[p++];
-      final row = data.sublist(p, p + rowLen).toList();
+      final row = data.sublist(p, p + rowLen);
       p += rowLen;
       final recon = List<int>.filled(rowLen, 0);
       for (var i = 0; i < rowLen; i++) {
@@ -380,10 +399,10 @@ class PdfParser {
         }
         recon[i] = (row[i] + pred) & 0xFF;
       }
-      out.addAll(recon);
+      out.setRange(r * rowLen, (r + 1) * rowLen, recon);
       prevRow = recon;
     }
-    return Uint8List.fromList(out);
+    return out;
   }
 
   int _paeth(int a, int b, int c) {
@@ -401,6 +420,16 @@ class PdfParser {
     if (obj is! PdfRef) return obj ?? const PdfNull();
     final cached = _cache[obj.num];
     if (cached != null) return cached;
+    try {
+      return _derefUncached(obj);
+    } on PdfParseException {
+      rethrow;
+    } catch (e) {
+      throw PdfParseException('Failed to resolve object ${obj.num}: $e');
+    }
+  }
+
+  PdfObject _derefUncached(PdfRef obj) {
     final entry = _entries[obj.num];
     if (entry == null) {
       throw PdfParseException('Object ${obj.num} not in xref');
@@ -428,8 +457,10 @@ class PdfParser {
       throw PdfParseException('Object $stmNum is not an object stream');
     }
     final data = _decodeStreamData(stm);
-    final n = stm.dict.number('N')?.toInt() ?? 0;
-    final first = stm.dict.number('First')?.toInt() ?? 0;
+    final nObj = deref(stm.dict['N']);
+    final n = nObj is PdfNumber ? nObj.asInt : 0;
+    final firstObj = deref(stm.dict['First']);
+    final first = firstObj is PdfNumber ? firstObj.asInt : 0;
     final c = _Cursor(data);
     final offsets = <int>[];
     for (var i = 0; i < n; i++) {

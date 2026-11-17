@@ -3,6 +3,12 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- Track recording keeps running when the phone locks, via a
+         foreground service of type location (no background-location
+         permission is needed while the service runs). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
     <application
         android:label="Patok"
         android:name="${applicationName}"
@@ -35,11 +41,25 @@
                 <data android:mimeType="application/pdf"/>
             </intent-filter>
             <intent-filter>
-                <action android:name="android.intent.action.VIEW"/>
+                <action android:name="android.intent.action.SEND_MULTIPLE"/>
                 <category android:name="android.intent.category.DEFAULT"/>
                 <data android:mimeType="application/pdf"/>
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <!-- BROWSABLE: VIEW intents sent from a browser carry this
+                     category, and a filter without it never matches them. -->
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:mimeType="application/pdf"/>
+            </intent-filter>
         </activity>
+        <!-- Foreground service keeping GPS track recording alive while the
+             phone is locked. Started/stopped from Dart (patok/track). -->
+        <service
+            android:name=".TrackRecordingService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
         <!-- FileProvider for the in-app updater: shares the downloaded APK
              with the system installer. -->
         <provider

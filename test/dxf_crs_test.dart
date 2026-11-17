@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -53,6 +54,20 @@ void main() {
       expect(utmZoneFor(115.5), 50);
       expect(utmZoneFor(-122.0), 10);
       expect(utmZoneFor(0.0), 31);
+    });
+
+    test('clamps to 1..60', () {
+      expect(utmZoneFor(180.0), 60);
+      expect(utmZoneFor(-180.0), 1);
+      expect(utmZoneFor(540.0), 60);
+    });
+  });
+
+  group('DxfUtm zone validation', () {
+    test('rejects zones outside 1..60', () {
+      expect(() => DxfUtm(zone: 0), throwsArgumentError);
+      expect(() => DxfUtm(zone: 61), throwsArgumentError);
+      expect(() => DxfUtm(zone: 999), throwsArgumentError);
     });
   });
 
@@ -159,6 +174,44 @@ void main() {
       );
     });
 
+    test('identical real-world points throw', () {
+      expect(
+        () => DxfLocalGrid(
+          name: 'bad',
+          zone: 50,
+          e1: 1000,
+          n1: 2000,
+          lon1: lonA,
+          lat1: latA,
+          e2: 6000,
+          n2: 7000,
+          lon2: lonA,
+          lat2: latA,
+        ),
+        throwsStateError,
+      );
+    });
+
+    test('absurd scale throws', () {
+      // Local points ~7000 apart but real points ~6900 km apart
+      // (scale ~1000): a typo in a reference point, not a grid.
+      expect(
+        () => DxfLocalGrid(
+          name: 'bad',
+          zone: 50,
+          e1: 1000,
+          n1: 2000,
+          lon1: lonA,
+          lat1: latA,
+          e2: 6000,
+          n2: 7000,
+          lon2: lonA,
+          lat2: 60.0,
+        ),
+        throwsStateError,
+      );
+    });
+
     test('json round-trip', () {
       final grid = rotatedGrid(15);
       final back =
@@ -195,6 +248,36 @@ void main() {
         expect(loaded, hasLength(1));
         expect(loaded.single.name, 'mine');
         expect(loaded.single.rotationDeg, closeTo(grid.rotationDeg, 1e-9));
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    test('all() skips a corrupt entry instead of wiping the rest', () async {
+      final dir = await Directory.systemTemp.createTemp('dxf_crs_bad');
+      try {
+        final good = DxfLocalGrid(
+          name: 'mine',
+          zone: 50,
+          e1: 1000,
+          n1: 2000,
+          lon1: 115.48,
+          lat1: -2.13,
+          e2: 6000,
+          n2: 7000,
+          lon2: 115.53,
+          lat2: -2.18,
+        );
+        final file = File('${dir.path}/dxf_local_grids.json');
+        await file.writeAsString(jsonEncode([
+          good.toJson(),
+          {'type': 'local', 'name': 'broken'}, // missing fields
+          {'type': 'nonsense'},
+        ]));
+        final store = await DxfLocalGridStore.load(dir);
+        final loaded = await store.all();
+        expect(loaded, hasLength(1));
+        expect(loaded.single.name, 'mine');
       } finally {
         await dir.delete(recursive: true);
       }

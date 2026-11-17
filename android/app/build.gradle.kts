@@ -27,6 +27,12 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Local builds are arm64-only, matching the CI build
+        // (--target-platform android-arm64): a fat multi-ABI APK is ~3x
+        // larger and this app only runs on ARM field phones.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
@@ -56,6 +62,14 @@ android {
                 signingConfigs.getByName("release")
             } else {
                 // Signing with the debug keys for now, so `flutter run --release` works.
+                // WARNING: this must never ship as a release — the CI workflow
+                // verifies the built APK's signature and fails the release
+                // when it finds debug keys (see patok-build-apk.yml).
+                logger.warn(
+                    "No release keystore configured (ANDROID_KEYSTORE_*); " +
+                        "release build is signed with DEBUG keys and must " +
+                        "not be published."
+                )
                 signingConfigs.getByName("debug")
             }
         }

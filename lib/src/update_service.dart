@@ -93,15 +93,22 @@ Future<UpdateInfo?> checkForUpdate() async {
   final version = tag.replaceFirst(RegExp(r'^v'), '');
   if (version.isEmpty || !isNewerVersion(version, current)) return null;
 
+  // Prefer the CI-built APK; fall back to the first .apk asset when a
+  // release attaches several (e.g. per-ABI splits).
   String? apkUrl;
+  String? firstApkUrl;
   for (final a in (json['assets'] as List? ?? const [])) {
     final name = (a['name'] as String? ?? '').toLowerCase();
     final url = a['browser_download_url'] as String?;
     if (name.endsWith('.apk') && url != null) {
-      apkUrl = url;
-      break;
+      firstApkUrl ??= url;
+      if (name == 'app-release.apk') {
+        apkUrl = url;
+        break;
+      }
     }
   }
+  apkUrl ??= firstApkUrl;
   return UpdateInfo(
     version: version,
     tag: tag,
@@ -129,8 +136,50 @@ Future<File> _apkFile(String version) async {
 
 /// True when a complete APK for [version] is already cached — e.g. the
 /// download finished but the Android install prompt was dismissed.
-Future<bool> isApkCached(String version) async =>
-    await (await _apkFile(version)).exists();
+/// Existence alone isn't enough: a truncated download must not be
+/// mistaken for a finished one, so the file must also look like a valid
+/// APK (ZIP local header + end-of-central-directory record).
+Future<bool> isApkCached(String version) async {
+  final file = await _apkFile(version);
+  if (!await file.exists()) return false;
+  return _looksLikeApk(file);
+}
+
+Future<bool> _looksLikeApk(File file) async {
+  try {
+    final len = await file.length();
+    if (len < 22) return false;
+    final raf = await file.open();
+    try {
+      final head = await raf.read(4);
+      if (head.length < 4 ||
+          head[0] != 0x50 ||
+          head[1] != 0x4B ||
+          head[2] != 0x03 ||
+          head[3] != 0x04) {
+        return false;
+      }
+      // The end-of-central-directory record (PK\x05\x06) sits in the
+      // last 64 KB + 22 bytes; a truncated file doesn't have it.
+      final tailLen = len < 65557 ? len : 65557;
+      await raf.setPosition(len - tailLen);
+      final tail = await raf.read(tailLen);
+      for (var i = tail.length - 22; i >= 0; i--) {
+        if (tail[i] == 0x50 &&
+            tail[i + 1] == 0x4B &&
+            tail[i + 2] == 0x05 &&
+            tail[i + 3] == 0x06) {
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      await raf.close();
+    }
+  } catch (_) {
+    return false;
+  }
+}
 
 /// Streams the APK into the cache with progress, writing to a `.part` file
 /// first and renaming on completion so a partial download is never mistaken
@@ -140,10 +189,16 @@ Future<bool> isApkCached(String version) async =>
 /// dropped connection on weak signal doesn't restart a 50+ MB download
 /// from zero. Falls back to a fresh download when the server ignores the
 /// range request.
+///
+/// [isCancelled] is polled between chunks: when it returns true the
+/// download stops with [DownloadCancelled] and the `.part` file is kept
+/// for a later resume. The body stream times out after 30 s without a
+/// chunk, so a stalled connection doesn't hang forever.
 Future<void> downloadApk(
   String apkUrl,
   String version, {
   required void Function(DownloadProgress progress) onProgress,
+  bool Function()? isCancelled,
   @visibleForTesting http.Client? client,
 }) async {
   final owned = client == null;
@@ -161,6 +216,15 @@ Future<void> downloadApk(
       await part.delete();
       resumeFrom = 0;
       res = await _sendDownload(client, apkUrl, resumeFrom: 0);
+    } else if (res.statusCode == 206 && resumeFrom > 0) {
+      // Server resumed from a different offset than asked: the part file
+      // doesn't match this stream, so discard it and start over.
+      final start = _rangeStart(res);
+      if (start != null && start != resumeFrom) {
+        await part.delete();
+        resumeFrom = 0;
+        res = await _sendDownload(client, apkUrl, resumeFrom: 0);
+      }
     }
 
     final bool resumed = res.statusCode == 206 && resumeFrom > 0;
@@ -176,24 +240,53 @@ Future<void> downloadApk(
     final total = _totalFrom(res, resumeFrom);
     var received = resumeFrom;
     final sw = Stopwatch()..start();
+    var lastReport = DateTime.fromMillisecondsSinceEpoch(0);
     final sink = part.openWrite(mode: resumed ? FileMode.append : FileMode.write);
     try {
-      await for (final chunk in res.stream) {
+      await for (final chunk
+          in res.stream.timeout(const Duration(seconds: 30))) {
+        if (isCancelled?.call() == true) throw const DownloadCancelled();
         sink.add(chunk);
         received += chunk.length;
-        final secs = sw.elapsedMilliseconds / 1000;
-        onProgress(DownloadProgress(
-          fraction: total > 0 ? received / total : -1,
-          bytesPerSecond: secs > 0 ? received / secs : 0,
-        ));
+        // Throttle progress callbacks: one per 100 ms is plenty for the
+        // UI, and per-chunk setState was rebuilding the sheet hundreds
+        // of times per second on fast connections.
+        final now = DateTime.now();
+        if (now.difference(lastReport).inMilliseconds >= 100 ||
+            received == total) {
+          lastReport = now;
+          final secs = sw.elapsedMilliseconds / 1000;
+          onProgress(DownloadProgress(
+            fraction: total > 0 ? received / total : -1,
+            // Speed counts only the bytes fetched this time, not the
+            // bytes resumed from a previous attempt.
+            bytesPerSecond: secs > 0 ? (received - resumeFrom) / secs : 0,
+          ));
+        }
       }
     } finally {
       await sink.close();
+    }
+    // The stream ended: verify the download is actually complete before
+    // the .part file is renamed into place, or a truncated APK would be
+    // treated as cached and brick the update loop.
+    if (total > 0 && received != total) {
+      throw HttpException(
+          'Download incomplete: received $received of $total bytes');
     }
     await part.rename(file.path);
   } finally {
     if (owned) client.close();
   }
+}
+
+/// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header,
+/// or null when the header is absent or unparseable.
+int? _rangeStart(http.StreamedResponse res) {
+  final contentRange = res.headers['content-range'];
+  if (contentRange == null) return null;
+  final m = RegExp(r'bytes (\d+)-').firstMatch(contentRange);
+  return m == null ? null : int.tryParse(m.group(1)!);
 }
 
 Future<http.StreamedResponse> _sendDownload(
@@ -234,9 +327,15 @@ Future<void> downloadAndInstall(
   String apkUrl, {
   required String version,
   required void Function(DownloadProgress progress) onProgress,
+  bool Function()? isCancelled,
 }) async {
+  if (apkUrl.isEmpty) {
+    throw StateError(
+        'This release has no APK attached, so it cannot be installed from the app.');
+  }
   if (!await isApkCached(version)) {
-    await downloadApk(apkUrl, version, onProgress: onProgress);
+    await downloadApk(apkUrl, version,
+        onProgress: onProgress, isCancelled: isCancelled);
   }
   await installApk(await _apkFile(version));
 }
@@ -253,14 +352,26 @@ String formatSpeed(double bytesPerSecond) {
   return '${bytesPerSecond.toStringAsFixed(0)} B/s';
 }
 
+/// Thrown when the user cancels a download (via the sheet's Cancel
+/// button). Not an error: the caller reports it neutrally.
+class DownloadCancelled implements Exception {
+  const DownloadCancelled();
+}
+
+/// Cached SharedPreferences instance: every update helper used to await
+/// getInstance() separately, one platform-channel round trip each.
+Future<SharedPreferences>? _prefsFuture;
+Future<SharedPreferences> _prefs() =>
+    _prefsFuture ??= SharedPreferences.getInstance();
+
 /// Daily auto-check preference.
 Future<bool> get autoCheckUpdate async {
-  final prefs = await SharedPreferences.getInstance();
+  final prefs = await _prefs();
   return prefs.getBool('autoCheckUpdate') ?? true;
 }
 
 Future<void> setAutoCheckUpdate(bool v) async {
-  final prefs = await SharedPreferences.getInstance();
+  final prefs = await _prefs();
   await prefs.setBool('autoCheckUpdate', v);
 }
 
@@ -271,16 +382,18 @@ Future<void> setAutoCheckUpdate(bool v) async {
 ///
 /// Call after the first frame (e.g. from the home shell's initState).
 Future<UpdateInfo?> maybeAutoCheckUpdate() async {
-  final prefs = await SharedPreferences.getInstance();
+  final prefs = await _prefs();
   if (!(prefs.getBool('autoCheckUpdate') ?? true)) return null;
   final now = DateTime.now().millisecondsSinceEpoch;
   if (now - (prefs.getInt('lastUpdateCheck') ?? 0) <
       const Duration(days: 1).inMilliseconds) {
     return null;
   }
-  await prefs.setInt('lastUpdateCheck', now);
   try {
     final info = await checkForUpdate();
+    // Only stamp the check once it actually ran: a failed check (offline,
+    // GitHub hiccup) used to suppress the next attempt for a whole day.
+    await prefs.setInt('lastUpdateCheck', now);
     if (info == null) return null;
     if (info.version == prefs.getString('dismissedUpdateVersion')) {
       return null;
@@ -292,6 +405,6 @@ Future<UpdateInfo?> maybeAutoCheckUpdate() async {
 }
 
 Future<void> dismissUpdateVersion(String version) async {
-  final prefs = await SharedPreferences.getInstance();
+  final prefs = await _prefs();
   await prefs.setString('dismissedUpdateVersion', version);
 }

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -29,10 +31,20 @@ class DxfImportFlow {
   bool useUtm = true;
   int utmZone = 50;
   bool utmSouth = true;
+
+  /// True once the user has picked a UTM zone/hemisphere this session, so
+  /// a screen re-push (e.g. after a map pick) doesn't reset the zone to
+  /// the remembered default.
+  bool utmConfigured = false;
   DxfLocalGrid? selectedGrid;
 
   String gridName = '';
   final List<DxfRefPoint> refPoints = [DxfRefPoint(), DxfRefPoint()];
+
+  /// Screen state that must survive the pop/re-push around map picking.
+  /// The current step, as an index into _Step.values.
+  int stepIndex = 0;
+  final List<bool> showLatLon = [false, false];
 
   void setRealPosition(int index, double? lon, double? lat) {
     refPoints[index].lon = lon;
@@ -74,12 +86,20 @@ class DxfImportScreen extends StatefulWidget {
 }
 
 class _DxfImportScreenState extends State<DxfImportScreen> {
-  _Step _step = _Step.pick;
+  // The current step lives in the flow so it survives the pop/re-push
+  // around map picking.
+  _Step get _step => _Step.values[widget.flow.stepIndex];
+  set _step(_Step value) => widget.flow.stepIndex = value.index;
+
   String _progress = 'Opening file picker…';
   String? _error;
 
   List<DxfLocalGrid> _grids = [];
   bool _gridsLoading = true;
+
+  // Live-solve preview is debounced: it re-solves (and re-parses the UTM
+  // projection) on every keystroke otherwise.
+  Timer? _previewTimer;
 
   // New-grid form controllers (synced back into the flow).
   final _gridNameCtl = TextEditingController();
@@ -99,7 +119,6 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
     TextEditingController(),
     TextEditingController(),
   ];
-  final List<bool> _showLatLon = [false, false];
   final List<bool> _gpsBusy = [false, false];
   String? _gridError;
   String? _gridPreview;
@@ -116,33 +135,37 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
       _nCtls[i].text = rp.northing;
       _eCtls[i].addListener(() {
         rp.easting = _eCtls[i].text;
-        _updateGridPreview();
+        _scheduleGridPreview();
       });
       _nCtls[i].addListener(() {
         rp.northing = _nCtls[i].text;
-        _updateGridPreview();
+        _scheduleGridPreview();
       });
       if (rp.lat != null) _latCtls[i].text = rp.lat.toString();
       if (rp.lon != null) _lonCtls[i].text = rp.lon.toString();
       _latCtls[i].addListener(() {
         rp.lat = double.tryParse(_latCtls[i].text);
-        _updateGridPreview();
+        _scheduleGridPreview();
       });
       _lonCtls[i].addListener(() {
         rp.lon = double.tryParse(_lonCtls[i].text);
-        _updateGridPreview();
+        _scheduleGridPreview();
       });
     }
-    // Restore remembered UTM defaults + saved grids.
+    // Restore remembered UTM defaults once per session, not on every
+    // re-push: a map pick pops and re-pushes this screen, and the zone
+    // the user changed this session must survive that round-trip.
     final scope = AppScope.of(context);
-    widget.flow.utmZone = scope.settings.lastDxfUtmZone;
-    widget.flow.utmSouth = scope.settings.lastDxfUtmSouth;
+    if (!flow.utmConfigured) {
+      flow.utmZone = scope.settings.lastDxfUtmZone;
+      flow.utmSouth = scope.settings.lastDxfUtmSouth;
+    }
     _loadGrids();
     // Start the picker right away, unless we're returning from a map pick
-    // (parsed is already set).
+    // (parsed is already set) — in that case keep the step we were on.
     if (flow.parsed == null) {
       Future.microtask(_pickFile);
-    } else {
+    } else if (flow.stepIndex == _Step.pick.index) {
       _step = _Step.summary;
       if (flow.name.isEmpty) {
         flow.name = flow.parsed!.fileName
@@ -168,6 +191,7 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
 
   @override
   void dispose() {
+    _previewTimer?.cancel();
     _gridNameCtl.dispose();
     for (final c in [
       ..._eCtls,
@@ -210,13 +234,39 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
 
   // ------------------------------------------------------------ grid form
 
+  /// Debounced live-solve preview: each keystroke reschedules it instead
+  /// of re-solving immediately.
+  void _scheduleGridPreview() {
+    _previewTimer?.cancel();
+    _previewTimer = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) _updateGridPreview();
+    });
+  }
+
+  /// Latitude/longitude range problem in the reference points, if any.
+  String? _refPointRangeError() {
+    for (var i = 0; i < 2; i++) {
+      final p = widget.flow.refPoints[i];
+      if (p.lat != null && (p.lat! < -90 || p.lat! > 90)) {
+        return 'Point ${i + 1}: latitude must be between -90 and 90.';
+      }
+      if (p.lon != null && (p.lon! < -180 || p.lon! > 180)) {
+        return 'Point ${i + 1}: longitude must be between -180 and 180.';
+      }
+    }
+    return null;
+  }
+
   /// Live solve preview: shows scale/rotation once both points are
   /// complete, or the reason they don't solve.
   void _updateGridPreview() {
     final flow = widget.flow;
     if (_step != _Step.newGrid) return;
     String? preview;
-    if (flow.refPoints.every((p) => p.complete)) {
+    final rangeError = _refPointRangeError();
+    if (rangeError != null) {
+      preview = rangeError;
+    } else if (flow.refPoints.every((p) => p.complete)) {
       try {
         final g = _buildGrid(flow);
         preview = 'Scale ${g.scale.toStringAsFixed(4)} • '
@@ -272,6 +322,11 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
         return;
       }
     }
+    final rangeError = _refPointRangeError();
+    if (rangeError != null) {
+      setState(() => _gridError = rangeError);
+      return;
+    }
     DxfLocalGrid grid;
     try {
       grid = _buildGrid(flow);
@@ -280,10 +335,49 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
       return;
     }
     final store = AppScope.of(context).localGrids;
-    final grids = await store.all();
+    late final List<DxfLocalGrid> grids;
+    try {
+      grids = await store.all();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _gridError = 'Could not load saved grids: $e');
+      }
+      return;
+    }
+    if (!mounted) return;
+    // A same-name grid already exists: confirm before overwriting it.
+    if (grids.any((g) => g.name == grid.name)) {
+      final overwrite = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Grid already exists'),
+          content: Text(
+            'A grid named "${grid.name}" already exists. Overwrite it?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Overwrite'),
+            ),
+          ],
+        ),
+      );
+      if (overwrite != true || !mounted) return;
+    }
     grids.removeWhere((g) => g.name == grid.name);
     grids.add(grid);
-    await store.saveAll(grids);
+    try {
+      await store.saveAll(grids);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _gridError = 'Could not save the grid: $e');
+      }
+      return;
+    }
     flow.selectedGrid = grid;
     flow.useUtm = false;
     if (mounted) {
@@ -355,7 +449,11 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
         },
       );
       if (crs is DxfUtm) {
-        await scope.settings.setLastDxfUtm(crs.zone, crs.southernHemisphere);
+        // Remember the zone separately: a prefs failure must not report
+        // an import that already succeeded as failed.
+        try {
+          await scope.settings.setLastDxfUtm(crs.zone, crs.southernHemisphere);
+        } catch (_) {}
       }
       if (mounted) Navigator.pop(context, imp);
     } catch (e) {
@@ -406,12 +504,13 @@ class _DxfImportScreenState extends State<DxfImportScreen> {
                   nCtls: _nCtls,
                   latCtls: _latCtls,
                   lonCtls: _lonCtls,
-                  showLatLon: _showLatLon,
+                  showLatLon: widget.flow.showLatLon,
                   gpsBusy: _gpsBusy,
                   error: _gridError,
                   preview: _gridPreview,
-                  onToggleLatLon: (i) =>
-                      setState(() => _showLatLon[i] = !_showLatLon[i]),
+                  onToggleLatLon: (i) => setState(
+                      () => widget.flow.showLatLon[i] =
+                          !widget.flow.showLatLon[i]),
                   onGps: _useGps,
                   onPickMap: _pickOnMap,
                   onBack: () => setState(() => _step = _Step.crs),
@@ -582,13 +681,20 @@ class _SummaryStep extends StatelessWidget {
   }
 }
 
-/// True when the drawing's native X range sits entirely outside any
-/// plausible UTM easting (100,000…900,000): almost certainly a local
-/// grid being imported as UTM, which would land it in the wrong place.
+/// True when the drawing's native coords sit outside any plausible UTM
+/// range for the chosen hemisphere: almost certainly a local grid being
+/// imported as UTM, which would land it in the wrong place.
 bool _looksNonUtm(DxfImportFlow flow) {
   final b = flow.parsed?.doc.bounds; // [minX, minY, maxX, maxY]
   if (b == null || b.length != 4) return false;
-  return b[2] < 100000 || b[0] > 900000;
+  // UTM eastings are 166,000…834,000 by definition (±3° from the central
+  // meridian at the equator, narrower elsewhere).
+  if (b[2] < 166000 || b[0] > 834000) return true;
+  // Northings: southern hemisphere runs ~1,000,000 (far south) to
+  // 10,000,000 (equator); northern runs 0 to 10,000,000. A local grid
+  // with plausible eastings but tiny northings is caught here.
+  if (flow.utmSouth) return b[3] < 1000000 || b[1] > 10000000;
+  return b[1] < 0 || b[3] > 10000000;
 }
 
 String _eastingRange(DxfImportFlow flow) {
@@ -654,6 +760,7 @@ class _CrsStep extends StatelessWidget {  const _CrsStep({
                     onChanged: (z) {
                       if (z != null) {
                         flow.utmZone = z;
+                        flow.utmConfigured = true;
                         onChanged();
                       }
                     },
@@ -668,6 +775,7 @@ class _CrsStep extends StatelessWidget {  const _CrsStep({
                   selected: {flow.utmSouth},
                   onSelectionChanged: (s) {
                     flow.utmSouth = s.first;
+                    flow.utmConfigured = true;
                     onChanged();
                   },
                 ),

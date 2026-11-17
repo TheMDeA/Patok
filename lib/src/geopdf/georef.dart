@@ -39,7 +39,35 @@ List<double> fitAffine(
   }
   final abc = _solve3([sxx, sxy, sx, sxy, syy, sy, sx, sy, n], [sxu, syu, su]);
   final def = _solve3([sxx, sxy, sx, sxy, syy, sy, sx, sy, n], [sxv, syv, sv]);
-  return [...abc, ...def];
+  final fit = [...abc, ...def];
+  // A least-squares solve on mis-paired or near-collinear points can
+  // return silently wrong coefficients (the solver only rejects
+  // near-singular systems). Check the fit actually passes through the
+  // control points, relative to the destination span so the test is
+  // scale-invariant. Exact fits (3 points, or consistent data) have
+  // ~0 residual; a wrong pairing is off by a large fraction of the span.
+  var maxResidual = 0.0;
+  var minU = dst[0].x, maxU = dst[0].x, minV = dst[0].y, maxV = dst[0].y;
+  for (var i = 0; i < src.length; i++) {
+    final u = fit[0] * src[i].x + fit[1] * src[i].y + fit[2];
+    final v = fit[3] * src[i].x + fit[4] * src[i].y + fit[5];
+    maxResidual = math.max(
+      maxResidual,
+      math.max((u - dst[i].x).abs(), (v - dst[i].y).abs()),
+    );
+    minU = math.min(minU, dst[i].x);
+    maxU = math.max(maxU, dst[i].x);
+    minV = math.min(minV, dst[i].y);
+    maxV = math.max(maxV, dst[i].y);
+  }
+  final span = math.max(maxU - minU, maxV - minV);
+  if (span > 0 && maxResidual > 0.05 * span) {
+    throw ArgumentError(
+      'Poor affine fit: max residual $maxResidual exceeds 5% of the '
+      'control-point span $span',
+    );
+  }
+  return fit;
 }
 
 /// Solves a 3x3 linear system given row-major [m] and [rhs].
@@ -96,12 +124,19 @@ List<math.Point<double>> _pairs(List<double> nums) {
 
 /// True when LPTS look like viewport-normalized coordinates (~0..1,
 /// Avenza-style) rather than page points (hundreds of points).
+///
+/// The threshold must stay close to the normalized range: page-points
+/// LPTS on a small page (say a 40x40pt viewport) are also "small", and
+/// the old < 50 cutoff misclassified those as normalized and folded a
+/// bogus BBox scaling into the affine. Normalized coordinates live in
+/// [0, 1] (allowing a little overshoot); any real page-points control
+/// set spans far more than 2pt.
 bool _looksNormalized(List<math.Point<double>> lpts) {
   var m = 0.0;
   for (final p in lpts) {
     m = math.max(m, math.max(p.x.abs(), p.y.abs()));
   }
-  return m < 50;
+  return m < 2;
 }
 
 /// Extracts georeferencing from every page of a parsed PDF.
@@ -117,18 +152,55 @@ class GeorefExtractor {
 
   PdfObject _deref(PdfObject? o) => _parser.deref(o);
 
+  /// Human-readable reasons why pages were skipped by the last
+  /// [extractAll] call, e.g. `Page 1: viewport: Singular system...`.
+  /// Pages with no georeferencing at all are not listed here.
+  final List<String> pageErrors = [];
+
+  /// Same as [PdfDict.number]/[stringValue]/[nameValue], but resolves
+  /// indirect references first: a value stored as `4 0 R` must not be
+  /// silently treated as absent.
+  double? _numberValue(PdfDict d, String key) {
+    final v = _deref(d[key]);
+    return v is PdfNumber ? v.value : null;
+  }
+
+  String? _stringValue(PdfDict d, String key) {
+    final v = _deref(d[key]);
+    if (v is PdfString) return v.value;
+    if (v is PdfHexString) return v.asLatin1;
+    return null;
+  }
+
+  String? _nameValue(PdfDict d, String key) {
+    final v = _deref(d[key]);
+    return v is PdfName ? v.name : null;
+  }
+
   /// Returns georeferencing for each page that has any, in page order.
+  /// A page whose georeferencing is broken is skipped (and reported in
+  /// [pageErrors]) instead of aborting the whole import.
   List<PageGeoref> extractAll() {
     final result = <PageGeoref>[];
+    pageErrors.clear();
     final pages = _parser.pages;
     for (var i = 0; i < pages.length; i++) {
-      final g = _extractPage(pages[i], i);
-      if (g != null) result.add(g);
+      try {
+        final g = _extractPage(pages[i], i);
+        if (g != null) result.add(g);
+      } catch (e) {
+        pageErrors.add('Page ${i + 1}: $e');
+      }
     }
     return result;
   }
 
   PageGeoref? _extractPage(PdfDict page, int pageIndex) {
+    // Failures of individual viewports / LGIDicts are collected here and
+    // only reported if the page yields no georeferencing at all: a page
+    // whose first viewport is broken but whose second one works still
+    // imports cleanly.
+    final attemptErrors = <String>[];
     final mediaBox = _deref(page['MediaBox']);
     double w = 612, h = 792; // default Letter
     if (mediaBox is PdfArray && mediaBox.items.length >= 4) {
@@ -136,7 +208,7 @@ class GeorefExtractor {
       w = (n[2] - n[0]).abs();
       h = (n[3] - n[1]).abs();
     }
-    final rotation = (page.number('Rotate')?.toInt() ?? 0) % 360;
+    final rotation = (_numberValue(page, 'Rotate')?.toInt() ?? 0) % 360;
 
     // 1. OGC style: /VP viewports with /Measure /Subtype /GEO.
     final vp = _deref(page['VP']);
@@ -150,8 +222,11 @@ class GeorefExtractor {
       vps.add(vp);
     }
     for (final v in vps) {
-      final measure = _deref(v['Measure']);
-      if (measure is PdfDict && measure.nameValue('Subtype') == 'GEO') {
+      try {
+        final measure = _deref(v['Measure']);
+        if (measure is! PdfDict || _nameValue(measure, 'Subtype') != 'GEO') {
+          continue;
+        }
         final gpts = _pairs(_numbers(_deref(measure['GPTS'])));
         final lpts = _pairs(_numbers(_deref(measure['LPTS'])));
         if (gpts.length < 3 || lpts.length < 3) continue;
@@ -194,8 +269,8 @@ class GeorefExtractor {
         String? wkt;
         String? desc;
         if (gcs is PdfDict) {
-          wkt = gcs.stringValue('WKT');
-          final epsg = gcs.number('EPSG')?.toInt();
+          wkt = _stringValue(gcs, 'WKT');
+          final epsg = _numberValue(gcs, 'EPSG')?.toInt();
           if (epsg != null) desc = 'EPSG:$epsg';
         }
         return PageGeoref(
@@ -214,6 +289,8 @@ class GeorefExtractor {
           srcWkt: wkt,
           crsDescription: desc ?? 'WGS 84',
         );
+      } catch (e) {
+        attemptErrors.add('viewport: $e');
       }
     }
 
@@ -229,74 +306,82 @@ class GeorefExtractor {
       lgis.add(lgiObj);
     }
     for (final lgi in lgis) {
-      String? wkt;
-      String? desc;
-      final proj = _deref(lgi['Projection']);
-      if (proj is PdfDict) {
-        wkt = proj.stringValue('WKT');
-        desc = _describeTerraGoProjection(proj);
-      }
+      try {
+        String? wkt;
+        String? desc;
+        final proj = _deref(lgi['Projection']);
+        if (proj is PdfDict) {
+          wkt = _stringValue(proj, 'WKT');
+          desc = _describeTerraGoProjection(proj);
+        }
 
-      final ctmObj = _deref(lgi['CTM']);
-      if (ctmObj is PdfArray && ctmObj.items.length == 6) {
-        // /CTM takes precedence: direct PDF user-space -> projected affine.
-        final m = ctmObj.numbers;
-        return PageGeoref(
-          pageIndex: pageIndex,
-          pageWidthPt: w,
-          pageHeightPt: h,
-          rotation: rotation,
-          kind: GeorefKind.terraGo,
-          a: m[0],
-          b: m[1],
-          c: m[4],
-          d: m[2],
-          e: m[3],
-          f: m[5],
-          srcIsLonLat: false,
-          srcWkt: wkt,
-          crsDescription: desc,
-        );
-      }
-
-      final regObj = _deref(lgi['Registration']);
-      if (regObj is PdfArray) {
-        final nums = regObj.numbers;
-        if (nums.length >= 16 && nums.length % 4 == 0) {
-          final src = <math.Point<double>>[];
-          final dst = <math.Point<double>>[];
-          for (var i = 0; i < nums.length; i += 4) {
-            src.add(math.Point(nums[i], nums[i + 1]));
-            dst.add(math.Point(nums[i + 2], nums[i + 3]));
-          }
-          final fit = fitAffine(src, dst);
+        final ctmObj = _deref(lgi['CTM']);
+        if (ctmObj is PdfArray && ctmObj.items.length == 6) {
+          // /CTM takes precedence: direct PDF user-space -> projected affine.
+          final m = ctmObj.numbers;
           return PageGeoref(
             pageIndex: pageIndex,
             pageWidthPt: w,
             pageHeightPt: h,
             rotation: rotation,
             kind: GeorefKind.terraGo,
-            a: fit[0],
-            b: fit[1],
-            c: fit[2],
-            d: fit[3],
-            e: fit[4],
-            f: fit[5],
+            a: m[0],
+            b: m[1],
+            c: m[4],
+            d: m[2],
+            e: m[3],
+            f: m[5],
             srcIsLonLat: false,
             srcWkt: wkt,
             crsDescription: desc,
           );
         }
+
+        final regObj = _deref(lgi['Registration']);
+        if (regObj is PdfArray) {
+          final nums = regObj.numbers;
+          if (nums.length >= 16 && nums.length % 4 == 0) {
+            final src = <math.Point<double>>[];
+            final dst = <math.Point<double>>[];
+            for (var i = 0; i < nums.length; i += 4) {
+              src.add(math.Point(nums[i], nums[i + 1]));
+              dst.add(math.Point(nums[i + 2], nums[i + 3]));
+            }
+            final fit = fitAffine(src, dst);
+            return PageGeoref(
+              pageIndex: pageIndex,
+              pageWidthPt: w,
+              pageHeightPt: h,
+              rotation: rotation,
+              kind: GeorefKind.terraGo,
+              a: fit[0],
+              b: fit[1],
+              c: fit[2],
+              d: fit[3],
+              e: fit[4],
+              f: fit[5],
+              srcIsLonLat: false,
+              srcWkt: wkt,
+              crsDescription: desc,
+            );
+          }
+        }
+      } catch (e) {
+        attemptErrors.add('LGIDict: $e');
       }
+    }
+    if (attemptErrors.isNotEmpty) {
+      pageErrors.add('Page ${pageIndex + 1}: ${attemptErrors.join('; ')}');
     }
     return null;
   }
 
   String? _describeTerraGoProjection(PdfDict proj) {
     final type =
-        proj.stringValue('ProjectionType') ?? proj.nameValue('ProjectionType');
-    final datum = proj.stringValue('Datum') ?? proj.nameValue('Datum');
-    final zone = proj.number('Zone')?.toInt();
+        _stringValue(proj, 'ProjectionType') ??
+        _nameValue(proj, 'ProjectionType');
+    final datum = _stringValue(proj, 'Datum') ?? _nameValue(proj, 'Datum');
+    final zone = _numberValue(proj, 'Zone')?.toInt();
     final parts = <String>[];
     if (type != null) parts.add(type);
     if (zone != null) parts.add('zone $zone');
@@ -382,26 +467,49 @@ math.Point<double> pixelToUserSpace({
   }
 }
 
+/// Cache of parsed projections keyed by their WKT/proj-string, so the
+/// same CRS isn't re-parsed for every corner (4x per base render, 4x
+/// per detail render, plus import). Bounded; the oldest entry is evicted
+/// first. Projections are safe to share: [proj4.Projection.transform]
+/// does not mutate them.
+final _projectionCache = <String, proj4.Projection>{};
+const _projectionCacheMax = 16;
+
+proj4.Projection _cachedProjection(String spec) {
+  final hit = _projectionCache[spec];
+  if (hit != null) return hit;
+  late final proj4.Projection parsed;
+  try {
+    parsed = proj4.Projection.parse(spec);
+  } catch (e) {
+    throw ArgumentError('Invalid projection definition: $e');
+  }
+  if (_projectionCache.length >= _projectionCacheMax) {
+    _projectionCache.remove(_projectionCache.keys.first);
+  }
+  _projectionCache[spec] = parsed;
+  return parsed;
+}
+
 /// Inverse of [toLonLat]: WGS84 lon/lat -> source-CRS coordinates.
 /// Used to map a visible map region back into PDF page space for the
-/// high-detail re-render. Falls back to identity when parsing fails.
+/// high-detail re-render. A null/empty [wkt] means the input is already
+/// in the source CRS (identity). An unparsable WKT or a non-finite
+/// result throws [ArgumentError] instead of silently returning the
+/// input unchanged: storing easting-as-degrees would place the map in
+/// the wrong ocean.
 math.Point<double> toProjected(double lon, double lat, String? wkt) {
   if (wkt == null || wkt.isEmpty) {
     return math.Point(lon, lat);
   }
-  try {
-    final src = proj4.Projection.parse(wkt);
-    final p = proj4.Projection.WGS84.transform(
-      src,
-      proj4.Point(x: lon, y: lat),
+  final src = _cachedProjection(wkt);
+  final p = proj4.Projection.WGS84.transform(src, proj4.Point(x: lon, y: lat));
+  if (!p.x.isFinite || !p.y.isFinite) {
+    throw ArgumentError(
+      'Projection produced a non-finite result for ($lon, $lat)',
     );
-    if (!p.x.isFinite || !p.y.isFinite) {
-      return math.Point(lon, lat);
-    }
-    return math.Point(p.x, p.y);
-  } catch (_) {
-    return math.Point(lon, lat);
   }
+  return math.Point(p.x, p.y);
 }
 
 /// Inverts the page affine transform: source-CRS (sx, sy) -> PDF user
@@ -420,21 +528,23 @@ math.Point<double> inverseAffine(PageGeoref georef, double sx, double sy) {
 }
 
 /// Converts a source-CRS coordinate to WGS84 lon/lat using [wkt].
-/// Falls back to treating the input as lon/lat when parsing fails.
+/// A null/empty [wkt] means the input is already lon/lat (identity).
+/// An unparsable WKT or a non-finite result throws [ArgumentError]
+/// instead of silently returning the input unchanged: a TerraGo page
+/// with a bad/missing WKT used to import with corners like
+/// lon=500000, lat=9200000 stored in the library.
 math.Point<double> toLonLat(double sx, double sy, String? wkt) {
   if (wkt == null || wkt.isEmpty) {
     return math.Point(sx, sy);
   }
-  try {
-    final src = proj4.Projection.parse(wkt);
-    final p = src.transform(proj4.Projection.WGS84, proj4.Point(x: sx, y: sy));
-    if (!p.x.isFinite || !p.y.isFinite) {
-      return math.Point(sx, sy);
-    }
-    return math.Point(p.x, p.y);
-  } catch (_) {
-    return math.Point(sx, sy);
+  final src = _cachedProjection(wkt);
+  final p = src.transform(proj4.Projection.WGS84, proj4.Point(x: sx, y: sy));
+  if (!p.x.isFinite || !p.y.isFinite) {
+    throw ArgumentError(
+      'Projection produced a non-finite result for ($sx, $sy)',
+    );
   }
+  return math.Point(p.x, p.y);
 }
 
 /// Formats a lon/lat as UTM (e.g. "50S 412300mE 9234500mN").
@@ -443,7 +553,7 @@ String formatUtm(double lon, double lat) {
   try {
     final zone = ((lon + 180) / 6).floor() + 1;
     final south = lat < 0;
-    final proj = proj4.Projection.parse(
+    final proj = _cachedProjection(
       '+proj=utm +zone=$zone +datum=WGS84 +units=m +no_defs'
       '${south ? ' +south' : ''}',
     );

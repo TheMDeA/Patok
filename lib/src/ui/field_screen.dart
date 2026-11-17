@@ -31,6 +31,39 @@ class FieldScreen extends StatefulWidget {
   State<FieldScreen> createState() => FieldScreenState();
 }
 
+/// Asks for a name, prefilled with [hint]. Save stays disabled while the
+/// name is empty, so waypoints and tracks can never be saved unnamed.
+Future<String?> askFieldName(BuildContext context, String hint) {
+  final ctrl = TextEditingController(text: hint);
+  var canSave = hint.trim().isNotEmpty;
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDialogState) => AlertDialog(
+        title: const Text('Name'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Name'),
+          onChanged: (v) =>
+              setDialogState(() => canSave = v.trim().isNotEmpty),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          FilledButton(
+            onPressed: canSave
+                ? () => Navigator.pop(ctx, ctrl.text.trim())
+                : null,
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class FieldScreenState extends State<FieldScreen> {
   List<Waypoint> _waypoints = [];
   List<Measurement> _measurements = [];
@@ -60,6 +93,42 @@ class FieldScreenState extends State<FieldScreen> {
     }
   }
 
+  /// Saves waypoints, showing an error if the write fails instead of
+  /// failing silently. Returns false when the save failed, so callers
+  /// can stop before announcing success or reloading stale state.
+  Future<bool> _saveWaypoints(List<Waypoint> wps) async {
+    try {
+      await AppScope.of(context).fieldData.saveWaypoints(wps);
+      return true;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content:
+                  Text('Couldn\'t save waypoints — please try again')),
+        );
+      }
+      return false;
+    }
+  }
+
+  /// Same as [_saveWaypoints] for measurements.
+  Future<bool> _saveMeasurements(List<Measurement> ms) async {
+    try {
+      await AppScope.of(context).fieldData.saveMeasurements(ms);
+      return true;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text(
+                  'Couldn\'t save measurements — please try again')),
+        );
+      }
+      return false;
+    }
+  }
+
   Future<void> _addWaypointAtGps() async {
     final scope = AppScope.of(context);
     final pos = await scope.locationService.currentPosition();
@@ -72,8 +141,8 @@ class FieldScreenState extends State<FieldScreen> {
       return;
     }
     if (!mounted) return;
-    final name = await _askName(context, 'Waypoint ${_waypoints.length + 1}');
-    if (name == null) return;
+    final name = await askFieldName(context, 'Waypoint ${_waypoints.length + 1}');
+    if (name == null || name.isEmpty) return;
     final wps = List<Waypoint>.of(_waypoints)
       ..add(Waypoint(
         id: _uuid.v4(),
@@ -81,7 +150,7 @@ class FieldScreenState extends State<FieldScreen> {
         longitude: pos.longitude,
         latitude: pos.latitude,
       ));
-    await scope.fieldData.saveWaypoints(wps);
+    if (!await _saveWaypoints(wps)) return;
     await _reload();
   }
 
@@ -92,8 +161,8 @@ class FieldScreenState extends State<FieldScreen> {
       final result = await showAverageWaypointSheet(context, averager);
       if (result == null || !mounted) return;
       final name =
-          await _askName(context, 'Waypoint ${_waypoints.length + 1}');
-      if (name == null) return;
+          await askFieldName(context, 'Waypoint ${_waypoints.length + 1}');
+      if (name == null || name.isEmpty) return;
       final wps = List<Waypoint>.of(_waypoints)
         ..add(Waypoint(
           id: _uuid.v4(),
@@ -103,49 +172,25 @@ class FieldScreenState extends State<FieldScreen> {
           note: 'Averaged from ${result.fixCount} fixes '
               '(±${result.precisionMeters.toStringAsFixed(1)} m)',
         ));
-      await scope.fieldData.saveWaypoints(wps);
+      if (!await _saveWaypoints(wps)) return;
       await _reload();
     } finally {
       averager.dispose();
     }
   }
 
-  Future<String?> _askName(BuildContext context, String hint) {
-    final ctrl = TextEditingController(text: hint);
-    return showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Name'),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: const InputDecoration(hintText: 'Name'),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-              child: const Text('Save')),
-        ],
-      ),
-    );
-  }
-
   Future<void> _toggleTrack() async {
     final scope = AppScope.of(context);
     final recorder = scope.trackRecorder;
     if (recorder.isRecording.value) {
-      final name = await _askName(
+      final name = await askFieldName(
           context, 'Track ${DateTime.now().toIso8601String().substring(0, 10)}');
-      if (name == null) return; // keep recording
+      if (name == null || name.isEmpty) return; // keep recording
       final track = await recorder.stop(name);
       if (track != null) {
         final ms = await scope.fieldData.measurements();
         ms.add(track);
-        await scope.fieldData.saveMeasurements(ms);
-        if (mounted) {
+        if (await _saveMeasurements(ms) && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Track saved')),
           );
@@ -334,14 +379,13 @@ class FieldScreenState extends State<FieldScreen> {
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () async {
-                              final store = scope.fieldData;
                               final messenger = ScaffoldMessenger.of(context);
                               final idx = _waypoints.indexOf(w);
                               final wps =
                                   List<Waypoint>.of(_waypoints)
                                     ..removeWhere(
                                         (e) => e.id == w.id);
-                              await store.saveWaypoints(wps);
+                              if (!await _saveWaypoints(wps)) return;
                               await _reload();
                               messenger.showSnackBar(
                                   SnackBar(
@@ -356,7 +400,9 @@ class FieldScreenState extends State<FieldScreen> {
                                                   idx.clamp(
                                                       0, _waypoints.length),
                                                   w);
-                                        await store.saveWaypoints(restored);
+                                        if (!await _saveWaypoints(restored)) {
+                                          return;
+                                        }
                                         await _reload();
                                       },
                                     ),
@@ -387,14 +433,13 @@ class FieldScreenState extends State<FieldScreen> {
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () async {
-                              final store = scope.fieldData;
                               final messenger = ScaffoldMessenger.of(context);
                               final idx = _measurements.indexOf(m);
                               final ms =
                                   List<Measurement>.of(_measurements)
                                     ..removeWhere(
                                         (e) => e.id == m.id);
-                              await store.saveMeasurements(ms);
+                              if (!await _saveMeasurements(ms)) return;
                               await _reload();
                               messenger.showSnackBar(
                                   SnackBar(
@@ -410,8 +455,10 @@ class FieldScreenState extends State<FieldScreen> {
                                                   idx.clamp(0,
                                                       _measurements.length),
                                                   m);
-                                        await store
-                                            .saveMeasurements(restored);
+                                        if (!await _saveMeasurements(
+                                            restored)) {
+                                          return;
+                                        }
                                         await _reload();
                                       },
                                     ),

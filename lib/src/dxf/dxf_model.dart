@@ -6,6 +6,13 @@ library;
 
 import 'dart:math' as math;
 
+/// Segment count for an arc sweeping [sweepDeg] degrees: roughly 10° per
+/// segment, so large arcs stay smooth and tiny ones don't waste vertices.
+int dxfSegmentsForSweep(double sweepDeg) {
+  final n = (sweepDeg.abs() / 10).ceil();
+  return n.clamp(4, 96);
+}
+
 /// A 2D point in the drawing's native coordinates (easting/northing).
 class DxfPoint {
   const DxfPoint(this.x, this.y);
@@ -116,7 +123,9 @@ class DxfText implements DxfEntity {
         layer: layer,
         position: t.apply(position),
         text: text,
-        height: height * (t.scaleX.abs() + t.scaleY.abs()) / 2,
+        // Geometric mean of the axis scales: exact for uniform scale, and
+        // the area-preserving choice when the insert is stretched.
+        height: height * math.sqrt(t.scaleX.abs() * t.scaleY.abs()),
         rotationDeg: rotationDeg + t.rotationDeg,
       );
 }
@@ -128,21 +137,37 @@ class DxfCircle implements DxfEntity {
   final DxfPoint center;
   final double radius;
 
-  /// Segmentized ring (closed).
-  List<DxfPoint> toRing({int segments = 48}) => [
-        for (var i = 0; i < segments; i++)
-          DxfPoint(
-            center.x + radius * math.cos(2 * math.pi * i / segments),
-            center.y + radius * math.sin(2 * math.pi * i / segments),
-          ),
-      ];
+  /// Segmentized ring (closed). Defaults to an adaptive count (~10° per
+  /// segment); pass [segments] to override.
+  List<DxfPoint> toRing({int? segments}) {
+    final n = segments ?? dxfSegmentsForSweep(360);
+    return [
+      for (var i = 0; i < n; i++)
+        DxfPoint(
+          center.x + radius * math.cos(2 * math.pi * i / n),
+          center.y + radius * math.sin(2 * math.pi * i / n),
+        ),
+    ];
+  }
 
   @override
-  DxfCircle transformed(DxfTransform t) => DxfCircle(
+  DxfEntity transformed(DxfTransform t) {
+    if (t.scaleX == t.scaleY) {
+      return DxfCircle(
         layer: layer,
         center: t.apply(center),
-        radius: radius * (t.scaleX.abs() + t.scaleY.abs()) / 2,
+        radius: radius * t.scaleX.abs(),
       );
+    }
+    // Non-uniform scale turns a circle into an ellipse, which has no
+    // exact entity here — segmentize it into a polyline instead of
+    // distorting it with an averaged radius.
+    return DxfPolyline(
+      layer: layer,
+      vertices: toRing().map(t.apply).toList(),
+      closed: true,
+    );
+  }
 }
 
 class DxfArc implements DxfEntity {
@@ -161,13 +186,15 @@ class DxfArc implements DxfEntity {
   final double endDeg;
 
   /// Segmentized polyline from [startDeg] to [endDeg] (counter-clockwise).
-  List<DxfPoint> toPolyline({int segments = 24}) {
+  /// Defaults to an adaptive count (~10° per segment).
+  List<DxfPoint> toPolyline({int? segments}) {
     var sweep = (endDeg - startDeg) % 360;
     if (sweep <= 0) sweep += 360;
+    final n = segments ?? dxfSegmentsForSweep(sweep);
     return [
-      for (var i = 0; i <= segments; i++)
+      for (var i = 0; i <= n; i++)
         () {
-          final a = (startDeg + sweep * i / segments) * math.pi / 180.0;
+          final a = (startDeg + sweep * i / n) * math.pi / 180.0;
           return DxfPoint(
             center.x + radius * math.cos(a),
             center.y + radius * math.sin(a),
@@ -177,13 +204,24 @@ class DxfArc implements DxfEntity {
   }
 
   @override
-  DxfArc transformed(DxfTransform t) => DxfArc(
+  DxfEntity transformed(DxfTransform t) {
+    if (t.scaleX == t.scaleY) {
+      return DxfArc(
         layer: layer,
         center: t.apply(center),
-        radius: radius * (t.scaleX.abs() + t.scaleY.abs()) / 2,
+        radius: radius * t.scaleX.abs(),
         startDeg: startDeg + t.rotationDeg,
         endDeg: endDeg + t.rotationDeg,
       );
+    }
+    // Non-uniform scale turns an arc into an elliptical arc — segmentize
+    // it instead of distorting it with an averaged radius.
+    return DxfPolyline(
+      layer: layer,
+      vertices: toPolyline().map(t.apply).toList(),
+      closed: false,
+    );
+  }
 }
 
 /// A HATCH boundary loop set (each loop = closed ring of points).
@@ -204,12 +242,22 @@ class DxfHatch implements DxfEntity {
 
 /// A named layer with its AutoCAD color index (1-255).
 class DxfLayer {
-  DxfLayer({required this.name, required this.colorIndex});
+  DxfLayer({required this.name, required this.colorIndex, this.off = false});
   final String name;
   final int colorIndex;
 
+  /// True when the layer is turned off in the CAD file (negative ACI color):
+  /// its entities are not drawn.
+  final bool off;
+
   /// ARGB color for [colorIndex]; falls back to white for unknown indices.
   int get argb => aciToArgb(colorIndex);
+}
+
+/// Point on a circle of radius [r] around [c] at [deg] degrees.
+DxfPoint _arcPoint(DxfPoint c, double r, double deg) {
+  final a = deg * math.pi / 180.0;
+  return DxfPoint(c.x + r * math.cos(a), c.y + r * math.sin(a));
 }
 
 /// A fully parsed drawing: layers plus entities with block INSERTs expanded.
@@ -247,9 +295,22 @@ class DxfDocument {
         case DxfCircle(:var center, :var radius):
           eat(DxfPoint(center.x - radius, center.y - radius));
           eat(DxfPoint(center.x + radius, center.y + radius));
-        case DxfArc(:var center, :var radius):
-          eat(DxfPoint(center.x - radius, center.y - radius));
-          eat(DxfPoint(center.x + radius, center.y + radius));
+        case DxfArc(
+            :var center,
+            :var radius,
+            :var startDeg,
+            :var endDeg
+          ):
+          // Actual arc extrema: the endpoints plus any cardinal point
+          // inside the sweep — not the full radius box.
+          var sweep = (endDeg - startDeg) % 360;
+          if (sweep <= 0) sweep += 360;
+          eat(_arcPoint(center, radius, startDeg));
+          eat(_arcPoint(center, radius, endDeg));
+          for (final a in [0.0, 90.0, 180.0, 270.0]) {
+            final rel = (a - startDeg) % 360;
+            if (rel > 0 && rel < sweep) eat(_arcPoint(center, radius, a));
+          }
         case DxfHatch(:var loops):
           for (final loop in loops) {
             for (final v in loop) {
