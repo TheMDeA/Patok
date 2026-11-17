@@ -582,9 +582,23 @@ class _SummaryStep extends StatelessWidget {
   }
 }
 
+/// True when the drawing's native X range sits entirely outside any
+/// plausible UTM easting (100,000…900,000): almost certainly a local
+/// grid being imported as UTM, which would land it in the wrong place.
+bool _looksNonUtm(DxfImportFlow flow) {
+  final b = flow.parsed?.doc.bounds; // [minX, minY, maxX, maxY]
+  if (b == null || b.length != 4) return false;
+  return b[2] < 100000 || b[0] > 900000;
+}
+
+String _eastingRange(DxfImportFlow flow) {
+  final b = flow.parsed?.doc.bounds;
+  if (b == null || b.length != 4) return '—';
+  return '${b[0].toStringAsFixed(0)}…${b[2].toStringAsFixed(0)}';
+}
+
 /// Step 3: UTM zone or a saved local grid.
-class _CrsStep extends StatelessWidget {
-  const _CrsStep({
+class _CrsStep extends StatelessWidget {  const _CrsStep({
     required this.flow,
     required this.grids,
     required this.gridsLoading,
@@ -664,6 +678,32 @@ class _CrsStep extends StatelessWidget {
               'Applies to the whole drawing. The zone is remembered for next time.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
+            if (_looksNonUtm(flow)) ...[
+              const SizedBox(height: 12),
+              Card(
+                color: Colors.amber.withValues(alpha: 0.15),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.warning_amber, color: Colors.amber),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'These coordinates (E ${_eastingRange(flow)}) '
+                          "don't look like UTM eastings — valid UTM "
+                          'eastings are 166,000…834,000. If this drawing '
+                          'uses a local mine grid, switch to Local grid '
+                          'above.',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ] else ...[
             Text('Mine grid', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),

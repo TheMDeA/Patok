@@ -12,6 +12,7 @@ import 'app_scope.dart';
 import '../dxf/dxf_crs.dart';
 import '../dxf/dxf_import.dart';
 import '../models.dart';
+import '../refresh_guard.dart';
 import '../services.dart';
 import '../geopdf/georef.dart';
 import '../theme.dart';
@@ -151,7 +152,16 @@ class MapScreenState extends State<MapScreen> {
     await _redrawAnnotations();
   }
 
-  Future<void> _refreshOverlays() async {
+  /// Serializes overlay refreshes: rendering a page takes seconds, and
+  /// overlapping runs used to race on the same source ids
+  /// ("Source fa_src_... already exists"). A refresh requested mid-run
+  /// joins the in-flight one and triggers one re-run afterwards.
+  final RefreshGuard _overlaysGuard = RefreshGuard();
+  final RefreshGuard _dxfGuard = RefreshGuard();
+
+  Future<void> _refreshOverlays() => _overlaysGuard.run(_refreshOverlaysInner);
+
+  Future<void> _refreshOverlaysInner() async {
     final c = _controller;
     if (c == null) return;
     // Annotation layers must exist before raster overlays reference them
@@ -1001,10 +1011,13 @@ class MapScreenState extends State<MapScreen> {
 
   final Map<String, _DxfOverlay> _dxfOverlays = {};
 
+  Future<void> _refreshDxfOverlays() =>
+      _dxfGuard.run(_refreshDxfOverlaysInner);
+
   /// Reconciles DXF overlays with library visibility: adds newly visible
   /// imports, drops hidden/removed ones. Style reloads clear everything
   /// (sources die with the style), so this also re-adds after reload.
-  Future<void> _refreshDxfOverlays() async {
+  Future<void> _refreshDxfOverlaysInner() async {
     final c = _controller;
     if (c == null || !_annLayersReady) return;
     final want = <String, DxfImport>{

@@ -3,9 +3,14 @@
 All notable changes to Patok are documented here. Entries are user-facing
 and concise.
 
-## [1.0.6] - 2026-10-18
+## [1.0.7] - 2026-11-17
 
 ### Fixed
+- Fixed a random "page(s) failed to render" error (Source already
+  exists): overlapping map refreshes no longer race on the same source
+- DXF import now warns when the drawing's coordinates don't look like
+  UTM eastings (e.g. a local mine grid), instead of silently placing it
+  in the wrong location
 - DXF drawings with many entities now appear on the map (large drawings
   are split into chunks that fit the map channel); a drawing that still
   fails to display now shows a message instead of failing silently
